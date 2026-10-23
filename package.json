@@ -1,0 +1,63 @@
+{
+  "name": "saysoio",
+  "version": "0.6.2",
+  "type": "module",
+  "description": "Check every transaction an AI agent is about to sign against the owner's plain-language mandate: allow, ask or block, before it is signed. Shadow or enforce mode, fail closed. The SDK never holds keys.",
+  "license": "MIT",
+  "keywords": [
+    "ai-agent",
+    "agent-wallet",
+    "transaction-security",
+    "base",
+    "ethereum",
+    "viem",
+    "agentkit",
+    "safe",
+    "multisig",
+    "intent"
+  ],
+  "homepage": "https://app.saysoio.com",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --import tsx --test test/*.test.ts",
+    "prepack": "node build.mjs"
+  },
+  "publishConfig": {
+    "access": "public",
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "import": "./dist/index.js"
+      }
+    }
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "peerDependencies": {
+    "viem": "^2.30.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0",
+    "viem": "^2.57.10"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/saysoio/sdk.git"
+  },
+  "bugs": {
+    "url": "https://github.com/saysoio/sdk/issues"
+  }
+}
