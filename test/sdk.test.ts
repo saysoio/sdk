@@ -8,6 +8,10 @@ import { base, baseSepolia } from 'viem/chains'
 import { Oathline, OathlineBlocked, OathlineNeedsApproval, OathlineUnavailable, OATHLINE_DOMAIN, OATHLINE_TYPES, OATHLINE_SIGNERS, OATHLINE_COSIGNERS, SDK_VERSION, officialSigner, txDigest } from '../src/index.js'
 import { readFileSync } from 'node:fs'
 import { isAddress } from 'viem'
+import { erc7821Actions, erc7715Actions } from 'viem/experimental'
+import { publicActionsL2, walletActionsL2 } from 'viem/op-stack'
+import { sendTransaction as rawSend } from 'viem/actions'
+import { CLIENT_READS, TESTED_VIEM, installedViem, newerViem, untestedViemWarning, warnIfUntestedViem } from '../src/viem-known.js'
 
 const ATTACKER: Address = '0x2222222222222222222222222222222222222222'
 const ASKER: Address = '0x4444444444444444444444444444444444444444'
@@ -672,22 +676,224 @@ test('scope() review 2026-10-23 (M1, H2): a guarded provider and a guarded CDP c
   const c = gp.getClient().evm
   assert.throws(() => Object.defineProperty(c, 'sendTransaction', { configurable: false }), TypeError)
   await assert.rejects(() => Object.getOwnPropertyDescriptor(c, 'sendTransaction')!.value({ to: ATTACKER }), OathlineBlocked)
+  // 0.6.3 (security desk F1): no prototype swap either
+  assert.throws(() => Object.setPrototypeOf(gp, {}), TypeError)
+  assert.throws(() => Object.setPrototypeOf(c, {}), TypeError)
   assert.deepEqual(sent, [])
 })
 
-test('R2 (review 2026-10-20): every action on the guarded wallet client is a known one (a new viem action fails this test until it is looked at)', () => {
+test('R2 (review 2026-10-20), 0.6.3: every function of viem\'s wallet and public actions is known to the SDK (a new viem action fails this test until it is looked at; meanwhile the guarded client refuses it in enforce mode)', () => {
   const client = createWalletClient({ account: privateKeyToAccount(generatePrivateKey()), chain: base, transport: custom({ request: async () => { throw new Error('no rpc') } }) })
   const g = new Oathline({ mode: 'enforce', apiUrl, apiKey: KEY, signer: SIGNER }).guard(client) as any
   // checked, refused or gated by the SDK
-  const GUARDED = ['sendTransaction', 'sendTransactionSync', 'signTransaction', 'writeContract', 'writeContractSync', 'sendCalls', 'sendCallsSync', 'sendRawTransaction', 'sendRawTransactionSync', 'deployContract', 'signAuthorization', 'signTypedData', 'signMessage', 'request', 'extend', 'scope']
-  // read, wallet-UI or preparation actions: none signs or sends (they go through the shut request when they reach the node)
-  const HARMLESS = ['addChain', 'fillTransaction', 'getAddresses', 'getCallsStatus', 'getCapabilities', 'getChainId', 'getPermissions', 'prepareAuthorization', 'prepareTransactionRequest', 'requestAddresses', 'requestPermissions', 'showCallsStatus', 'switchChain', 'waitForCallsStatus', 'watchAsset']
-  const fns = Object.keys(g).filter(k => typeof g[k] === 'function')
-  assert.deepEqual(fns.filter(k => !GUARDED.includes(k) && !HARMLESS.includes(k)), [])
+  const GUARDED = ['sendTransaction', 'sendTransactionSync', 'signTransaction', 'writeContract', 'writeContractSync', 'sendCalls', 'sendCallsSync', 'sendRawTransaction', 'sendRawTransactionSync', 'deployContract', 'signAuthorization', 'signTypedData', 'signMessage', 'switchChain', 'addChain', 'request', 'extend', 'scope']
+  const known = (k: string) => GUARDED.includes(k) || CLIENT_READS.has(k)
+  const fns = (o: any) => Object.keys(o).filter(k => typeof o[k] === 'function')
+  assert.deepEqual(fns(g).filter(k => !known(k)), [], 'the guarded wallet client')
+  // viem's own sets of actions, read straight from the installed viem: wallet, public, and the OP Stack L2 reads used on Base
+  assert.deepEqual(fns(walletActions(client as any)).filter(k => !known(k)), [], 'walletActions')
+  assert.deepEqual(fns(publicActions(client as any)).filter(k => !known(k)), [], 'publicActions')
+  assert.deepEqual(fns(publicActionsL2()(client as any)).filter(k => !known(k)), [], 'publicActionsL2')
+  // the allow list holds no function that signs or sends
+  for (const k of CLIENT_READS) assert.doesNotMatch(k, /^(send|sign|write|deploy|execute|grant|initiate|deposit|prove|finalize)/, k)
   // groups of actions: only the token group is known; each of its functions is wrapped (none is viem's own)
   const groups = Object.keys(g).filter(k => g[k] && typeof g[k] === 'object' && !['account', 'transport', 'chain', 'ccipRead', 'batch'].includes(k))
   assert.ok(groups.every(k => k === 'token'), groups.join(','))
   if (g.token) for (const k of Object.keys(g.token)) assert.notEqual(g.token[k], (client as any).token[k], k)
+})
+
+test('0.6.3 (security desk 2026-10-25, F2): a function the SDK does not know is refused in enforce mode, also from an add-on installed before guard(); reads stay allowed; add-ons installed after guard() work through the check', async () => {
+  const toNode: string[] = []
+  const send = async ({ method }: any) => {
+    toNode.push(method)
+    if (method === 'eth_chainId') return '0x2105'
+    if (method === 'eth_getTransactionCount') return '0x0'
+    if (method === 'eth_estimateGas') return '0x5208'
+    if (method === 'eth_gasPrice' || method === 'eth_maxPriorityFeePerGas') return '0x1'
+    if (method === 'eth_getBlockByNumber') return { baseFeePerGas: '0x1', number: '0x1', timestamp: '0x1', hash: `0x${'0'.repeat(64)}` }
+    if (method === 'eth_getBalance') return '0x64'
+    if (method === 'eth_call') return `0x${'0'.repeat(63)}1`   // supportsExecutionMode: yes
+    if (/^eth_send/.test(method)) return `0x${'1'.repeat(64)}`
+    throw new Error(`no rpc ${method}`)
+  }
+  const account = privateKeyToAccount(generatePrivateKey())   // throwaway key, never funded
+  const mk = () => createWalletClient({ account, chain: base, transport: custom({ request: send }) })
+  const decisions: Array<[string, string]> = []
+  const enforce = (c: any) => new Oathline({ mode: 'enforce', apiUrl, apiKey: KEY, signer: SIGNER, onDecision: (r, _t, d) => decisions.push([d, r.reason]) }).guard(c) as any
+  const execute = { address: account.address, calls: [{ to: ATTACKER, value: 1n }] }
+  const sends = () => toNode.filter(m => /send|sign/i.test(m))
+  // viem's own ERC-7821 add-on, installed before guard(): its execute signed with the raw account before 0.6.3
+  const g = enforce(mk().extend(erc7821Actions()).extend(erc7715Actions()).extend(walletActionsL2()).extend(publicActionsL2()).extend(publicActions))
+  await assert.rejects(() => g.execute(execute), (e: any) => e instanceof OathlineBlocked && /execute: this wallet function is not one sayso knows; it is refused in enforce mode until sayso supports it/.test(e.message))
+  await assert.rejects(() => g.executeBatches({ address: account.address, batches: [] }), OathlineBlocked)
+  await assert.rejects(() => g.grantPermissions({ expiry: 1, permissions: [] }), OathlineBlocked)
+  await assert.rejects(() => g.initiateWithdrawal({ request: { gas: 21000n, to: ATTACKER, value: 1n } }), OathlineBlocked)
+  // the same on a scoped copy, through a property descriptor, and on a guarded client extended further
+  await assert.rejects(() => g.scope().execute(execute), OathlineBlocked)
+  await assert.rejects(() => Object.getOwnPropertyDescriptor(g, 'execute')!.value(execute), OathlineBlocked)
+  await assert.rejects(() => g.extend(() => ({ extra: 1 })).execute(execute), OathlineBlocked)
+  assert.deepEqual(sends(), [], 'nothing was signed or sent')
+  assert.equal(decisions.at(-1)?.[0], 'refused')
+  // a hand-written add-on before guard() that sends with the raw client: refused the same way
+  const raw = mk()
+  const sneaky = enforce(raw.extend(() => ({ payNow: async () => rawSend(raw, { to: ATTACKER, value: 1n }) })))
+  await assert.rejects(() => sneaky.payNow(), OathlineBlocked)
+  assert.deepEqual(sends(), [])
+  // reads and preparation stay allowed (viem's public actions, the OP Stack fee reads, ERC-7821's mode query)
+  assert.equal(await g.getBalance({ address: account.address }), 100n)
+  assert.equal(await g.getChainId(), 8453)
+  assert.equal(typeof g.estimateL1Fee, 'function'); assert.equal(typeof g.supportsExecutionMode, 'function')
+  assert.equal(g.getBalance, g.getBalance)
+  // plain object methods are not wallet functions
+  assert.equal(String(g), '[object Object]'); assert.equal(g.hasOwnProperty('request'), true)
+  // an add-on installed AFTER guard() is handed the guarded client: it works, and what it sends is checked
+  const after = enforce(mk()).extend(erc7821Actions())
+  assert.equal(typeof after.execute, 'function')
+  // viem's execute calls its own sendTransaction with the client it was handed: the guarded one has no account that signs
+  await assert.rejects(() => after.execute(execute), /signTransaction is not a function/)
+  assert.deepEqual(sends(), [])
+  // a function that sends through the client's actions goes through the check
+  const viaCheck = enforce(mk()).extend((c: any) => ({ payNow: (to: Address) => c.sendTransaction({ to, value: 1n }) }))
+  await assert.rejects(() => viaCheck.payNow(ATTACKER), OathlineBlocked)   // sayso's block
+  assert.deepEqual(sends(), [])
+  assert.match(await viaCheck.payNow(SAVED), /^0x1{64}$/)               // sayso's allow
+  // a later extension cannot make an earlier raw function look like its own: the name alone does not count
+  const g2 = enforce(mk().extend(erc7821Actions()))
+  g2.extend(() => ({ execute: async () => 'mine' }))
+  await assert.rejects(() => g2.execute(execute), OathlineBlocked)
+  // no prototype swap either (security desk F1)
+  assert.throws(() => Object.setPrototypeOf(g, {}), TypeError)
+})
+
+test('0.6.3 review 2026-10-27 (L1, L2): other shapes of an add-on installed before guard() are refused too, and an unawaited refusal does not take the agent down', async () => {
+  const toNode: string[] = []
+  const send = async ({ method }: any) => { toNode.push(method); if (method === 'eth_chainId') return '0x2105'; if (method === 'eth_getTransactionCount') return '0x0'; if (method === 'eth_estimateGas') return '0x5208'; if (method === 'eth_gasPrice' || method === 'eth_maxPriorityFeePerGas') return '0x1'; if (method === 'eth_getBlockByNumber') return { baseFeePerGas: '0x1', number: '0x1', timestamp: '0x1', hash: `0x${'0'.repeat(64)}` }; if (/^eth_send/.test(method)) return `0x${'1'.repeat(64)}`; throw new Error(`no rpc ${method}`) }
+  const raw = createWalletClient({ account: privateKeyToAccount(generatePrivateKey()), chain: base, transport: custom({ request: send }) })
+  const pay = () => rawSend(raw, { to: ATTACKER, value: 1n })
+  const PAY = Symbol.for('pay')
+  const hidden = {}; Object.defineProperty(hidden, 'pay', { value: pay, enumerable: false })
+  class Payer { pay() { return pay() } }
+  const withAddOns = raw.extend(() => ({ [PAY]: pay, simulate: pay, registry: new Map([['pay', pay]]), hidden, payer: new Payer(), scope: () => ({ pay }) }) as any)
+  const g = new Oathline({ mode: 'enforce', apiUrl, apiKey: KEY, signer: SIGNER }).guard(withAddOns as any) as any
+  await assert.rejects(() => g[PAY](), OathlineBlocked)                 // a symbol-keyed function
+  await assert.rejects(() => g.simulate(), OathlineBlocked)             // an allow-listed name that is not viem's own function
+  await assert.rejects(() => g.scope(), OathlineBlocked)                // an add-on's own scope from before guard()
+  await assert.rejects(() => g.registry.get('pay'), OathlineBlocked)   // a Map of functions: its own methods are refused before anything comes out
+  await assert.rejects(async () => g.hidden.pay(), OathlineBlocked)     // a non-enumerable method
+  await assert.rejects(async () => g.payer.pay(), OathlineBlocked)      // a class instance's method
+  assert.deepEqual(toNode.filter(m => /send|sign/i.test(m)), [], 'nothing was signed or sent')
+  // viem's own simulate and scope on a plain guarded client are still fine
+  const plain = new Oathline({ mode: 'enforce', apiUrl, apiKey: KEY, signer: SIGNER }).guard(createWalletClient({ account: privateKeyToAccount(generatePrivateKey()), chain: base, transport: custom({ request: send }) }).extend(publicActions)) as any
+  assert.equal(plain.simulate, plain.simulate); assert.equal(typeof plain.scope().sendTransaction, 'function')
+  // L2: a refusal nobody awaits is not an unhandled rejection
+  const unhandled: unknown[] = []; const onUnhandled = (e: unknown) => unhandled.push(e)
+  process.on('unhandledRejection', onUnhandled)
+  const r = g.simulate(); assert.ok(r instanceof Promise)
+  await new Promise(res => setTimeout(res, 50))
+  process.off('unhandledRejection', onUnhandled)
+  assert.deepEqual(unhandled, [])
+  await assert.rejects(() => r, OathlineBlocked)
+})
+
+test('0.6.3 review 2026-10-27 (M3): a checked transaction is signed only for the chain sayso checked; switchChain and addChain are refused in enforce mode', async () => {
+  const signed: any[] = [], toNode: string[] = []
+  const send = async ({ method, params }: any) => { toNode.push(method); if (method === 'eth_chainId') return '0x2105'; if (method === 'eth_sendRawTransaction') { signed.push(parseTransaction(params[0])); return `0x${'66'.repeat(32)}` } throw new Error(`no rpc ${method}`) }
+  const g = new Oathline({ mode: 'enforce', apiUrl, apiKey: KEY, signer: SIGNER }).guard(createWalletClient({ account: privateKeyToAccount(generatePrivateKey()), chain: base, transport: custom({ request: send }) })) as any
+  const fees = { gas: 60000n, nonce: 0, maxFeePerGas: 2n, maxPriorityFeePerGas: 1n }
+  const abi = parseAbi(['function transfer(address to, uint256 amount) returns (bool)'])
+  await assert.rejects(() => g.sendTransaction({ to: SAVED, value: 1n, chainId: 1, ...fees }), (e: any) => e instanceof OathlineBlocked && /another chain.*chainId 1/.test(e.message))
+  await assert.rejects(() => g.sendTransaction({ to: SAVED, value: 1n, chain: null, ...fees }), OathlineBlocked)
+  await assert.rejects(() => g.sendTransaction({ to: SAVED, value: 1n, assertChainId: false, ...fees }), OathlineBlocked)
+  await assert.rejects(() => g.writeContract({ address: SAVED, abi, functionName: 'transfer', args: [SAVED, 1n], chainId: 1, ...fees }), OathlineBlocked)
+  await assert.rejects(() => g.switchChain({ id: 1 }), OathlineBlocked)
+  await assert.rejects(() => g.addChain({ chain: base }), OathlineBlocked)
+  assert.deepEqual(signed, [])
+  // an allowed one is signed for Base, also when the call names Base's id itself
+  await g.sendTransaction({ to: SAVED, value: 1n, ...fees })
+  await g.sendTransaction({ to: SAVED, value: 1n, chainId: 8453, ...fees })
+  assert.deepEqual((signed as any[]).map(t => t.chainId), [8453, 8453])
+})
+
+test('0.6.3 re-check 2026-10-27 (R1, R2, R3): an outage does not stop shadow mode; nested add-on functions are refused; a list on the client is not a group', async () => {
+  const toNode: string[] = []
+  const send = async ({ method }: any) => { toNode.push(method); if (method === 'eth_chainId') return '0x2105'; if (method === 'eth_getTransactionCount') return '0x0'; if (method === 'eth_estimateGas') return '0x5208'; if (method === 'eth_gasPrice' || method === 'eth_maxPriorityFeePerGas') return '0x1'; if (method === 'eth_getBlockByNumber') return { baseFeePerGas: '0x1', number: '0x1', timestamp: '0x1', hash: `0x${'0'.repeat(64)}` }; if (method === 'eth_call') return `0x${'0'.repeat(63)}5`; if (/^eth_send/.test(method)) return `0x${'1'.repeat(64)}`; throw new Error(`no rpc ${method}`) }
+  const mk = (extra: any = {}) => createWalletClient({ account: privateKeyToAccount(generatePrivateKey()), chain: base, transport: custom({ request: send }), ...extra })
+  // R1: sayso unreachable, no chainId in the options: shadow mode still sends (signed for the client's chain)
+  const down = (() => { throw new Error('unreachable') }) as unknown as typeof fetch
+  const shadow = new Oathline({ mode: 'shadow', apiUrl: 'http://127.0.0.1:1', apiKey: KEY, fetch: down }).guard(mk()) as any
+  assert.match(await shadow.sendTransaction({ to: SAVED, value: 1n }), /^0x1{64}$/)
+  await assert.rejects(() => new Oathline({ mode: 'enforce', apiUrl: 'http://127.0.0.1:1', apiKey: KEY, fetch: down }).guard(mk() as any).sendTransaction({ to: SAVED, value: 1n } as any), OathlineUnavailable)
+  // R2: a function nested deeper in an add-on installed before guard() is refused like a top-level one
+  const raw = mk()
+  const kit = raw.extend(() => ({ kit: { inner: { pay: () => rawSend(raw as any, { to: ATTACKER, value: 1n } as any) } } }) as any)
+  const g = new Oathline({ mode: 'enforce', apiUrl, apiKey: KEY, signer: SIGNER }).guard(kit as any) as any
+  toNode.length = 0
+  await assert.rejects(() => g.kit.inner.pay(), OathlineBlocked)
+  assert.deepEqual(toNode.filter(m => /send|sign/i.test(m)), [])
+  // ... while a nested group added after guard() works (its functions were built on the guarded client)
+  const after = new Oathline({ mode: 'enforce', apiUrl, apiKey: KEY, signer: SIGNER }).guard(mk() as any).extend((c: any) => ({ kit: { inner: { chainNow: () => c.getChainId() } } }))
+  assert.equal(await after.kit.inner.chainNow(), 8453)
+  // R3: viem's `tokens` option (a list) stays a list, and token reads added after guard() work
+  const withTokens = new Oathline({ mode: 'enforce', apiUrl, apiKey: KEY, signer: SIGNER }).guard(mk({ tokens: [{ address: SAVED, symbol: 'X', decimals: 6 }] }) as any) as any
+  assert.ok(Array.isArray(withTokens.tokens), 'the list is handed out as a list')
+  const reads = withTokens.extend(publicActions)
+  if (typeof reads.token?.getBalance === 'function') assert.notEqual(await reads.token.getBalance({ token: SAVED, account: SAVED }).catch((e: Error) => e.message), 'tokens is not iterable')
+})
+
+test('0.6.3 re-check 2026-10-26 (R4): an Array subclass with its own method, a Promise of raw functions and deep nesting are refused too', async () => {
+  const toNode: string[] = []
+  const send = async ({ method }: any) => { toNode.push(method); if (method === 'eth_chainId') return '0x2105'; if (method === 'eth_getTransactionCount') return '0x0'; if (method === 'eth_estimateGas') return '0x5208'; if (method === 'eth_gasPrice' || method === 'eth_maxPriorityFeePerGas') return '0x1'; if (method === 'eth_getBlockByNumber') return { baseFeePerGas: '0x1', number: '0x1', timestamp: '0x1', hash: `0x${'0'.repeat(64)}` }; if (/^eth_send/.test(method)) return `0x${'1'.repeat(64)}`; throw new Error(`no rpc ${method}`) }
+  const raw: any = createWalletClient({ account: privateKeyToAccount(generatePrivateKey()), chain: base, transport: custom({ request: send }) })
+  const pay = () => rawSend(raw, { to: ATTACKER, value: 1n } as any)
+  class L extends Array { pay() { return pay() } }
+  const list = new L(); list.push(1)
+  let deep: any = { pay }; for (let i = 0; i < 9; i++) deep = { [`l${i}`]: deep }
+  const cyclic: any = { pay }; cyclic.self = cyclic
+  const g = new Oathline({ mode: 'enforce', apiUrl, apiKey: KEY, signer: SIGNER }).guard(raw.extend(() => ({ list, ready: Promise.resolve({ pay }), kit: { later: Promise.resolve({ pay }) }, deep, cyclic })) as any) as any
+  await assert.rejects(async () => g.list.pay(), OathlineBlocked)
+  await assert.rejects(async () => (await g.ready).pay(), OathlineBlocked)
+  await assert.rejects(async () => (await g.kit.later).pay(), OathlineBlocked)
+  let d = g.deep; for (let i = 8; i >= 0; i--) d = d[`l${i}`]
+  await assert.rejects(async () => d.pay(), OathlineBlocked)
+  await assert.rejects(async () => g.cyclic.self.self.self.self.self.self.self.self.pay(), OathlineBlocked)
+  assert.deepEqual(toNode.filter(m => /send|sign/i.test(m)), [], 'nothing was signed or sent')
+  assert.equal(g.list[0], 1)   // the data is still there
+})
+
+test('0.6.3: in shadow mode an unknown function goes ahead and sayso is told "would have blocked"; before the owner\'s switch is known it is refused', async () => {
+  const toNode: string[] = []
+  const send = async ({ method }: any) => { toNode.push(method); if (method === 'eth_chainId') return '0x2105'; if (method === 'eth_getTransactionCount') return '0x0'; if (method === 'eth_estimateGas') return '0x5208'; if (method === 'eth_gasPrice' || method === 'eth_maxPriorityFeePerGas') return '0x1'; if (method === 'eth_getBlockByNumber') return { baseFeePerGas: '0x1', number: '0x1', timestamp: '0x1', hash: `0x${'0'.repeat(64)}` }; if (/^eth_send/.test(method)) return `0x${'1'.repeat(64)}`; throw new Error(`no rpc ${method}`) }
+  const account = privateKeyToAccount(generatePrivateKey())
+  const raw = createWalletClient({ account, chain: base, transport: custom({ request: send }) }).extend(() => ({ syncHelper: (x: number) => x + 1 }))
+  await new Promise(r => setTimeout(r, 50)); reports.length = 0
+  const log: string[] = []
+  const shadow = new Oathline({ mode: 'shadow', apiUrl, apiKey: KEY, signer: SIGNER, onDecision: (r, _t, d) => log.push(`${r.verdict} ${d}`) }).guard(raw) as any
+  assert.equal(shadow.syncHelper(1), 2)   // a plain function keeps its plain answer in shadow mode
+  for (let i = 0; i < 50 && reports.length < 1; i++) await new Promise(r => setTimeout(r, 20))
+  assert.deepEqual(log, ['block shadow'])
+  assert.equal(reports[0]?.kind, 'unknown wallet function (syncHelper)'); assert.equal(reports[0]?.verdict, 'block')
+  // called again and again: every call is a decision, but sayso is told once (review 2026-10-27, L3)
+  for (let i = 0; i < 5; i++) shadow.syncHelper(i)
+  await new Promise(r => setTimeout(r, 100))
+  assert.equal(log.length, 6); assert.equal(reports.filter(r => r.kind === 'unknown wallet function (syncHelper)').length, 1)
+  // the owner decides (no mode in code) and no answer from sayso yet: decided as enforce, like every call it cannot check
+  // (refused as a rejected promise, whether the function was plain or async: nothing ran)
+  await assert.rejects(() => new Oathline({ apiUrl, apiKey: KEY, signer: SIGNER }).guard(raw as any).syncHelper(1), OathlineBlocked)
+})
+
+test('0.6.3 (security desk F3): the newest viem the tests ran on is written down, and a newer installed viem gets one warning', () => {
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { devDependencies: Record<string, string> }
+  assert.equal(TESTED_VIEM, pkg.devDependencies.viem.replace(/^\^/, ''), 'TESTED_VIEM follows the viem in devDependencies')
+  assert.match(installedViem() ?? '', /^\d+\.\d+\.\d+/)
+  assert.equal(newerViem('2.57.10', '2.57.10'), false); assert.equal(newerViem('2.57.11', '2.57.10'), true); assert.equal(newerViem('2.58.0', '2.57.10'), true)
+  assert.equal(newerViem('3.0.0-next.14', '2.57.10'), true); assert.equal(newerViem('2.57.1', '2.57.10'), false); assert.equal(newerViem('2.30.0', '2.57.10'), false)
+  assert.equal(newerViem('2.57.10-beta.1', '2.57.10'), false); assert.equal(newerViem('nonsense', '2.57.10'), false)
+  assert.equal(untestedViemWarning(TESTED_VIEM), null); assert.equal(untestedViemWarning(null), null)
+  assert.match(untestedViemWarning('2.58.0') ?? '', /viem 2\.58\.0 is newer than the newest viem this SDK was tested with \(2\.57\.10\)/)
+  // at most once per process, whatever the installed viem (constructing an Oathline above may already have said it)
+  const said: string[] = []
+  warnIfUntestedViem(m => said.push(m)); warnIfUntestedViem(m => said.push(m))
+  assert.ok(said.length <= 1)
 })
 
 test('review 2026-10-20 N1/N2: what is signed is exactly what was checked (no to or data override, no suffix added after, no deployment by a missing to)', async () => {

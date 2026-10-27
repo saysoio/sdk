@@ -10,8 +10,10 @@ import { OATHLINE_COSIGNERS, officialSigner } from './official'
 import { safeTxHash, safeTxToJson, type SafeTx } from './safe'
 import { GUARDED } from './owner'
 import { SDK_VERSION } from './version'
+import { CLIENT_READS, isViemOwn, warnIfUntestedViem } from './viem-known'
 
 export * from './version'
+export { TESTED_VIEM } from './viem-known'
 export * from './typed-data'
 export * from './chain'
 export * from './official'
@@ -181,7 +183,7 @@ const typedDataCounterparty = (td: any): Address => { const m = td?.message ?? {
 
 /** Proxy traps that refuse every write: a write through a guarded object would reach the raw one, and a property made
  *  non-configurable would then read raw through its descriptor (review 2026-10-23, H2 and M1). */
-const NO_WRITES = { defineProperty: () => false, deleteProperty: () => false, preventExtensions: () => false } as const
+const NO_WRITES = { defineProperty: () => false, deleteProperty: () => false, preventExtensions: () => false, setPrototypeOf: () => false } as const
 
 export class Oathline {
   private readonly floor: CheckModeName
@@ -193,6 +195,7 @@ export class Oathline {
     if (opts.mode !== undefined && opts.mode !== 'shadow' && opts.mode !== 'enforce') throw new Error(`mode must be 'shadow' or 'enforce' (got ${String(opts.mode)})`)
     this.floor = opts.mode ?? 'shadow'
     this.failClosed = opts.failClosed ?? true
+    warnIfUntestedViem()   // once per process, when the installed viem is newer than the newest the SDK was tested with (0.6.3)
   }
 
   /** The mode in force now: the higher of the floor fixed in code and the owner's switch as last seen (shadow until
@@ -464,6 +467,25 @@ export class Oathline {
     throw new OathlineBlocked(result, tx)
   }
 
+  /** A function on a guarded viem client that the SDK does not know (0.6.3, security desk 2026-10-25, F2): a new viem
+   *  action, or an add-on's method installed before guard(), which holds the raw client. Refused in enforce mode, reported
+   *  as "would have blocked" in shadow mode; decided like the other calls sayso cannot check (the last mode seen, and
+   *  enforce while the owner's switch is not known yet). Returns the refusal, or null when the call may go ahead. */
+  private unknownFunction(name: string): OathlineBlocked | null {
+    const tx: TxRequest = { to: ZERO, data: '0x' }
+    const result: CheckResult = { verdict: 'block', reason: `${name}: this wallet function is not one sayso knows; it is refused in enforce mode until sayso supports it` }
+    if (this.modeWithoutAnswer === 'shadow') {
+      this.opts.onDecision?.(result, tx, 'shadow')
+      // told to sayso once per function every 10 minutes, so a helper polled in a loop does not flood the owner's log and chat (review 2026-10-27, L3)
+      const last = this.unknownReported.get(name) ?? 0
+      if (Date.now() - last > 600_000) { this.unknownReported.set(name, Date.now()); this.report(`unknown wallet function (${name})`, '', tx) }
+      return null
+    }
+    this.opts.onDecision?.(result, tx, 'refused')
+    return new OathlineBlocked(result, tx)
+  }
+  private readonly unknownReported = new Map<string, number>()
+
   /** A CDP client (`getClient()` on AgentKit's CDP provider), wrapped: see CDP_EVM_READ above. */
   private guardCdpClient(raw: any): any {
     const self = this
@@ -543,7 +565,10 @@ export class Oathline {
    * Guard a viem WalletClient: sendTransaction, writeContract and signTransaction (and their Sync variants) are
    * checked first; signTypedData and signMessage go through the signature policy; batches (sendCalls), already signed
    * transactions (sendRawTransaction), deployments and the raw JSON-RPC door (request) are refused in enforce mode
-   * until sayso can check them (0.4.0). Returns a new client; the original stays unguarded (keep it private).
+   * until sayso can check them (0.4.0). Any other function is refused in enforce mode and reported in shadow mode
+   * unless it neither signs nor sends (CLIENT_READS) or was added through the guarded client's `extend` (0.6.3): guard
+   * the client right after creating it and add extensions to the guarded client. Returns a new client; the original
+   * stays unguarded (keep it private).
    */
   guard<C extends { extend: (fn: (c: any) => any) => any; account?: { address: Address } | undefined; sendTransaction: (args: any) => Promise<Hex>; writeContract: (args: any) => Promise<Hex>; signTransaction: (args: any) => Promise<any> }>(client: C): C {
     const self = this
@@ -602,13 +627,55 @@ export class Oathline {
      *  `extend` is treated the same; other groups added through `extend` are built on the guarded client, so they pass. */
     const DATA_GROUPS = new Set(['account', 'transport', 'chain', 'ccipRead', 'batch'])
     const TOKEN_WRITES: Record<string, 'writeContract' | 'writeContractSync'> = { transfer: 'writeContract', approve: 'writeContract', transferSync: 'writeContractSync', approveSync: 'writeContractSync' }
-    const hasFunctions = (o: any): boolean => !!o && typeof o === 'object' && Object.values(o).some(v => typeof v === 'function' || hasFunctions(v))
-    const ownGroups = new Set(Object.keys(client).filter(k => !DATA_GROUPS.has(k) && hasFunctions((client as any)[k])))
+    /** every function name an object answers to: its own (also non-enumerable) and inherited ones, but not plain
+     *  object methods (a Map's get, a class's methods count; review 2026-10-27, L1) */
+    // data whose methods only read (a list, a date, bytes): never a group of actions (re-check 2026-10-27, R3: viem's `tokens` option is a list)
+    // (only an object whose own prototype IS one of these is data: a subclass with methods of its own is not; a Promise
+    // is never data, its value is guarded when it arrives; re-check 2026-10-26, R4)
+    const DATA_PROTOS = new Set<unknown>([Array.prototype, Date.prototype, RegExp.prototype, ...[Uint8Array, Uint8ClampedArray, Uint16Array, Uint32Array, Int8Array, Int16Array, Int32Array, Float32Array, Float64Array, BigInt64Array, BigUint64Array].map(T => T.prototype), Object.getPrototypeOf(Uint8Array.prototype), ArrayBuffer.prototype, Error.prototype, String.prototype, Number.prototype, Boolean.prototype])
+    const isThenable = (o: any): boolean => { try { return typeof o?.then === 'function' } catch { return true } }
+    /** how deep a group is copied; deeper objects (or a cycle) are guarded lazily, as they are read */
+    const MAX_DEPTH = 6
+    const fnNames = (o: any): string[] => {
+      const names = new Set<string>()
+      for (let p = o; p && p !== Object.prototype && !DATA_PROTOS.has(p); p = Object.getPrototypeOf(p)) for (const k of Object.getOwnPropertyNames(p)) { if (k === 'constructor' || (Array.isArray(o) && /^\d+$|^length$/.test(k))) continue; try { if (typeof o[k] === 'function') names.add(k) } catch { /* a getter that throws */ } }
+      return [...names]
+    }
+    /** does this object hold functions anywhere? Past the depth budget a non-empty object counts as holding some (fail closed, R4) */
+    const hasFunctions = (o: any, depth = 0): boolean => {
+      if (!o || typeof o !== 'object') return false
+      if (isThenable(o)) return true
+      if (depth >= MAX_DEPTH) return Reflect.ownKeys(o).length > 0
+      return fnNames(o).length > 0 || Object.values(o).some(v => typeof v === 'function' || hasFunctions(v, depth + 1))
+    }
+    const ownGroups = new Set(Object.getOwnPropertyNames(client).filter(k => !DATA_GROUPS.has(k) && hasFunctions((client as any)[k])))
     const groupCache = new Map<string, { raw: any; view: any }>()
-    const originalFns = new Map([...ownGroups].map(g => [g, new Set(Object.keys((client as any)[g]).filter(k => typeof (client as any)[g][k] === 'function'))]))
-    const group = (o: any, path: string): any => {
+    /** one value inside a group, guarded: a function the SDK does not know is refused, an object holding functions is a group */
+    const inGroup = (o: any, v: unknown, path: string, depth: number): any =>
+      typeof v === 'function' ? (extFns.has(v) ? v : gatedIn(o, path, v as (...a: any[]) => any)) : v && typeof v === 'object' && hasFunctions(v) ? group(v, path, depth + 1) : v
+    /** past the depth budget (or in a cycle): a read-through view that guards each value as it is read */
+    const deepViews = new WeakMap<object, any>()
+    const deepView = (o: any, path: string): any => {
+      let v = deepViews.get(o)
+      if (!v) {
+        v = new Proxy(o, {
+          ...NO_WRITES,
+          get(t, p) { const x = Reflect.get(t, p, t); if (typeof p !== 'string' && typeof x !== 'function') return x; return typeof x === 'function' ? (extFns.has(x) ? x : gatedIn(t, `${path}.${String(p)}`, x)) : x && typeof x === 'object' ? deepView(x, `${path}.${String(p)}`) : x },
+          getOwnPropertyDescriptor(t, p) { const d = Reflect.getOwnPropertyDescriptor(t, p); return d && 'value' in d && d.configurable ? { ...d, value: this.get!(t, p, t) } : d },
+        })
+        deepViews.set(o, v)
+      }
+      return v
+    }
+    const group = (o: any, path: string, depth = 0): any => {
+      if (depth >= MAX_DEPTH) return deepView(o, path)
+      // a promise: what it resolves to is guarded the same way when it arrives (R4)
+      if (isThenable(o)) { const p = Promise.resolve(o).then(v => inGroup(o, v, `${path}.then`, depth)); p.catch(() => undefined); return p }
+      // a plain list stays a list (R3); its elements are copied into a plain array, so a subclass cannot bring its methods (R4)
+      if (Array.isArray(o) && Object.getPrototypeOf(o) === Array.prototype) return Object.freeze(Array.from({ length: o.length }, (_, i) => inGroup(o, o[i], `${path}.${i}`, depth)))
       const out: Record<string, any> = {}
-      for (const [k, v] of Object.entries(o)) {
+      const entries: Array<[string, unknown]> = [...Object.entries(o), ...fnNames(o).filter(k => !Object.prototype.propertyIsEnumerable.call(o, k)).map(k => [k, o[k]] as [string, unknown])]
+      for (const [k, v] of entries) {
         if (typeof v === 'function') {
           const fn = v as (...a: any[]) => any
           const write = path === 'token' ? TOKEN_WRITES[k] : undefined
@@ -616,13 +683,43 @@ export class Oathline {
           const helper = [fn, (o as any)[k.replace(/Sync$/, '')]].find(f => typeof f === 'function' && Object.hasOwn(f, 'call') && typeof f.call === 'function')
           out[k] = write && helper
             ? async (args: any) => (actions as any)[write]({ ...args, ...helper.call(args) })
-            : !originalFns.get(path)?.has(k) ? fn   // added later by an extension, which was handed the guarded client
-            : async (...a: any[]) => { await self.gateUnchecked(`client action ${path}.${k}`, '', unchecked); return fn(...a) }
-        } else out[k] = v && typeof v === 'object' ? group(v, `${path}.${k}`) : v
+            : extFns.has(fn) ? fn   // added by an extension after guard(), which was handed the guarded client (by identity, at any depth; re-check R2)
+            : gatedIn(o, `${path}.${k}`, fn)
+        } else out[k] = inGroup(o, v, `${path}.${k}`, depth)
       }
       return Object.freeze(out)
     }
+    /** a function inside a group that the SDK does not know: refused in enforce mode, reported in shadow mode; the
+     *  refusal is marked handled, so one nobody awaits does not take the agent down (re-check 2026-10-27, L2) */
+    function gatedIn(o: any, name: string, fn: (...a: any[]) => any) {
+      return (...a: any[]) => { const p = (async () => { await self.gateUnchecked(`client action ${name}`, '', unchecked); return fn.apply(o, a) })(); p.catch(() => undefined); return p }
+    }
     const groupView = (p: string, raw: any): any => { const c = groupCache.get(p); if (c && c.raw === raw) return c.view; const view = group(raw, p); groupCache.set(p, { raw, view }); return view }
+    /** Functions added through the guarded `extend` (0.6.3): their extension was handed the guarded client, so what they
+     *  sign or send goes through the check. Kept by identity, not by name: a later extension cannot vouch for an earlier
+     *  raw function of the same name on another copy. viem's scope() runs the extension again, which records its new ones. */
+    const extFns = new WeakSet<object>()
+    const recordExt = (out: any, depth = 0): any => {
+      if (out && typeof out === 'object' && depth < 6) for (const k of Reflect.ownKeys(out)) { let v: any; try { v = out[k] } catch { continue } if (typeof v === 'function') extFns.add(v); else if (v && typeof v === 'object') recordExt(v, depth + 1) }
+      return out
+    }
+    /** a function the guarded client may hand out as it is: a checked action of the SDK's own, one added through the
+     *  guarded extend, one that neither signs nor sends (CLIENT_READS), or a plain object method (toString and the like) */
+    const knownFn = (t: object, p: string | symbol, v: Function): boolean =>
+      (typeof p === 'string' && Object.hasOwn(actions, p) && v === (actions as Record<string | symbol, unknown>)[p]) || extFns.has(v)
+      || (Object.hasOwn(t, p) ? typeof p === 'string' && CLIENT_READS.has(p) && isViemOwn(p, v) : (Object.prototype as unknown as Record<string | symbol, unknown>)[p] === v)
+    /** the stand-in for an unknown function: one per function, so it reads the same twice */
+    const unknownOf = new WeakMap<Function, Function>()
+    const unknownFn = (name: string, fn: Function): Function => {
+      let w = unknownOf.get(fn)
+      if (!w) {
+        // refused as a rejected promise that is marked handled: an agent that awaits it gets the refusal, and one that
+        // does not (a plain function's caller) is not taken down by an unhandled rejection (review 2026-10-27, L2)
+        w = function (this: unknown, ...a: unknown[]) { const no = self.unknownFunction(name); if (!no) return fn.apply(this, a); const p = Promise.reject(no); p.catch(() => undefined); return p }
+        unknownOf.set(fn, w)
+      }
+      return w
+    }
     /** one guarded view per client object, so viem's own memo (a scope per signal) gives the same guarded copy back */
     const shutOf = new WeakMap<object, any>()
     const isClient = (o: any): boolean => !!o && typeof o === 'object' && typeof o.request === 'function'
@@ -635,13 +732,17 @@ export class Oathline {
           if (p === 'account') return accountView(t.account)
           if (p === 'transport') return transportView(t.transport)
           // an extension is handed the shut client, so it cannot give the account or transport out either
-          if (p === 'extend') return (fn: any) => shut(t.extend((inner: any) => fn(shut(inner))).extend(() => actions))
+          if (p === 'extend') return (fn: any) => shut(t.extend((inner: any) => recordExt(fn(shut(inner)))).extend(() => actions))
           const v = Reflect.get(t, p, r)
           // viem 2.57.10 (22 Oct 2026) added scope(): a copy rebuilt from the original client with the same extensions,
           // so it has the checked actions but the raw request, account and transport; it is shut the same way. An
           // extension may define its own scope: it runs with the guarded client, never the raw one, as `this` (2026-10-23)
-          if (p === 'scope' && typeof v === 'function') return (...a: any[]) => { const s = v.apply(px, a); return isClient(s) ? shut(s) : s }
+          // (0.6.3: only viem's own scope or one added after guard(); an add-on's scope from before guard() holds the raw client)
+          if (p === 'scope' && typeof v === 'function') return extFns.has(v) || isViemOwn('scope', v) ? (...a: any[]) => { const s = v.apply(px, a); return isClient(s) ? shut(s) : s } : unknownFn('scope', v)
           if (typeof p === 'string' && ownGroups.has(p) && hasFunctions(v)) return groupView(p, v)
+          // 0.6.3: deny by default. A function the SDK does not know (a new viem action, an add-on installed before
+          // guard() with the raw client inside, one under a symbol) is refused in enforce mode and reported in shadow mode
+          if (typeof v === 'function' && !knownFn(t, p, v)) return unknownFn(String(p), v)
           return v
         },
         // the same answers when read through a property descriptor (non-configurable ones cannot be; viem's are configurable)
@@ -650,9 +751,7 @@ export class Oathline {
           return d && 'value' in d && d.configurable ? { ...d, value: this.get!(t, p, px) } : d
         },
         // a write would reach the raw client, and a property made non-configurable would then read raw (review 2026-10-23, H2)
-        defineProperty: () => false,
-        deleteProperty: () => false,
-        preventExtensions: () => false,
+        ...NO_WRITES,
       })
       shutOf.set(c, px)
       return px as C
@@ -682,15 +781,35 @@ export class Oathline {
      *  writeContract nor a suffix added by viem afterwards can change the transaction. writeContract signs through the
      *  original client's sendTransaction for that reason. A transaction with no `to` deploys a contract: refused in
      *  enforce mode like deployContract. */
+    /** Why this call would be signed for another chain than the one sayso checks for (review 2026-10-27, M3: with a
+     *  local account viem signs for a `chainId` passed in the call; with `chain: null` or `assertChainId: false` a JSON-RPC
+     *  wallet signs on whatever chain it is on); null when it cannot. */
+    /** the chain sayso checks for; when it cannot be read (sayso unreachable), the client's own chain, so the outage is
+     *  decided by gate() like any other (re-check 2026-10-27, R1: shadow mode must not stop on it) */
+    const checkedChain = async (): Promise<number | undefined> => (await self.chainId().catch(() => undefined)) ?? (client as any).chain?.id
+    const otherChain = async (args: any): Promise<string | null> => {
+      const serverChain = await checkedChain()
+      if (serverChain === undefined) return null
+      if (args?.chain === null) return 'chain: null'
+      if (args?.assertChainId === false) return 'assertChainId: false'
+      if (args?.chain && args.chain.id !== serverChain) return `chain ${String(args.chain.id)}`
+      if (args?.chainId !== undefined && args.chainId !== null && Number(args.chainId) !== serverChain) return `chainId ${String(args.chainId)}`
+      return null
+    }
     const checked = (method: string, kind: 'plain' | 'contract') => async (args: any) => {
       if (kind === 'plain' && (args?.to === undefined || args?.to === null)) { await self.gateUnchecked(`contract deployment (${method} with no \`to\`)`, '', unchecked); return (client as any)[method](real(args)) }
       const wallet = walletOf(args), tx = kind === 'plain' ? plainTx(args) : contractTx(args)
+      const elsewhere = await otherChain(args)
+      if (elsewhere) { await self.gateUnchecked(`transaction for another chain than sayso checks (${method}, ${elsewhere})`, '', tx); return (client as any)[method](real(args)) }
       if (authorized(args)) await self.gateAuthorization('attached to the transaction', tx)
       const nonce = await nonceFor(args, wallet)
       await self.gate(wallet, { ...tx, nonce }, chainOfWallet(args))
-      if (kind === 'plain') return (client as any)[method](placed(real({ ...args, to: tx.to, data: tx.data, dataSuffix: '0x' }), nonce))
+      // signed for the checked chain: a local account signs for this chainId, a JSON-RPC wallet must be on the client's chain
+      const pinned = await checkedChain()
+      const pin = { ...(pinned !== undefined ? { chainId: pinned } : {}), assertChainId: true }
+      if (kind === 'plain') return (client as any)[method](placed(real({ ...args, to: tx.to, data: tx.data, dataSuffix: '0x', ...pin }), nonce))
       const { abi: _abi, address: _address, functionName: _fn, args: _args, to: _to, data: _data, ...rest } = args
-      return (client as any)[method === 'writeContractSync' ? 'sendTransactionSync' : 'sendTransaction'](placed(real({ ...rest, to: tx.to, data: tx.data, dataSuffix: '0x' }), nonce))
+      return (client as any)[method === 'writeContractSync' ? 'sendTransactionSync' : 'sendTransaction'](placed(real({ ...rest, to: tx.to, data: tx.data, dataSuffix: '0x', ...pin }), nonce))
     }
     const plainTx = (args: any): TxRequest => ({ to: getAddress(args.to), data: withSuffix(args.data ?? '0x', suffixOf(args)), value: args.value })
     const contractTx = (args: any): TxRequest => ({ to: getAddress(args.address), data: withSuffix(encodeFunctionData({ abi: args.abi, functionName: args.functionName, args: args.args }), suffixOf(args)), value: args.value })
@@ -707,6 +826,9 @@ export class Oathline {
       sendRawTransaction: refused('sendRawTransaction', 'already signed transaction (sendRawTransaction)'),
       sendRawTransactionSync: refused('sendRawTransactionSync', 'already signed transaction (sendRawTransactionSync)'),
       deployContract: refused('deployContract', 'contract deployment (deployContract)'),
+      // they change which chain a JSON-RPC wallet signs for: refused in enforce mode (review 2026-10-27, M3)
+      switchChain: refused('switchChain', 'switching the wallet\'s chain (switchChain)'),
+      addChain: refused('addChain', 'adding a chain to the wallet (addChain)'),
       signAuthorization: async (args: any) => { const code = args?.contractAddress ?? args?.address; await self.gateAuthorization(`signAuthorization for ${code ?? 'unknown code'}`, { to: typeof code === 'string' && /^0x[0-9a-fA-F]{40}$/.test(code) ? getAddress(code) : ZERO, data: '0x' }); return (client as any).signAuthorization(real(args)) },
       signTypedData: async (args: any) => { const wallet = walletOf(args); await self.gateSignature('typed data', describeTypedData(args), { to: typedDataCounterparty(args), wallet, typedData: args, code: codeOf(wallet) }); return (client as any).signTypedData(real(args)) },
       signMessage: async (args: any) => { const wallet = walletOf(args); await self.gateSignature('message', 'personal message', { wallet, message: args?.message, code: codeOf(wallet) }); return (client as any).signMessage(real(args)) },

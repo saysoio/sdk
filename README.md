@@ -9,6 +9,27 @@ explanation, and answers **allow**, **ask** or **block** with a one-line reason.
 This package wraps the agent's wallet so that check happens before anything is signed. It never sees or holds
 a key, and sayso never holds funds.
 
+**0.6.3: wallet functions sayso does not know are refused in enforce mode.** Until 0.6.2 the guarded viem client
+checked the functions it knew and let any other function through: a new viem action, or the method of an add-on
+installed with `.extend(...)` **before** `guard()`, which holds the raw client. viem's own ERC-7821 add-on
+(`erc7821Actions().execute`) signed with the raw account that way, in enforce mode too (security desk, 25 Oct). Since
+0.6.3 such a function throws `OathlineBlocked` ("execute: this wallet function is not one sayso knows; it is refused in
+enforce mode until sayso supports it") in enforce mode, and goes ahead and is reported as "would have blocked" in shadow
+mode. Functions that neither sign nor send stay allowed by an explicit list (viem's public actions such as `getBalance`
+and `readContract`, the wallet client's reads such as `getAddresses` and `getChainId`, the OP Stack fee reads, ERC-7821's
+`supportsExecutionMode`), and so does anything added **after** `guard()` (it is handed the guarded client, so what it
+sends goes through the check). So: call `guard()` right after creating the client and add extensions to the guarded
+client. The SDK also warns once when the installed viem is newer than the newest it was tested with (`TESTED_VIEM`,
+2.57.10), and the object it returns refuses a prototype swap. Also in 0.6.3 (review of 27 Oct): a checked transaction is
+signed only for the chain sayso checked (a `chainId`, `chain` or `assertChainId: false` that points elsewhere is refused
+in enforce mode, and the signing call is pinned to the checked chain), and `switchChain` and `addChain` are refused in
+enforce mode. **Breaking for** an agent decided as enforce (written in code, switched on by the owner, or no `mode`
+written and no answer from sayso yet) that calls a sending function of an add-on installed before `guard()`,
+`switchChain`/`addChain`, or a transaction for another chain: these were unchecked before and are refused now. In shadow
+mode they go ahead and are reported (an unknown function once every 10 minutes). Note: viem's ERC-7821 `execute` cannot
+be used on a guarded client yet (refused when installed before `guard()`, and it fails when installed after, because the
+guarded client has no account that signs). No outside team runs in enforce mode today.
+
 **0.6.2 (needed with viem 2.57.10 or newer).** viem 2.57.10 (22 Oct 2026) added `client.scope()`, which rebuilds a
 copy of a client from the original one. On a guarded client before 0.6.2 that copy kept the checked actions but had
 the raw `request`, `account` and `transport`, so `guarded.scope().account.signTransaction(...)` or
@@ -303,7 +324,9 @@ const oathline = new Oathline({
 // the client must be created WITH the agent's account: the check is for that account's address
 const walletClient = createWalletClient({ account: agentAccount, chain: base, transport: http() })
 const wallet = oathline.guard(walletClient)
-// from here on the agent uses `wallet`, never `walletClient` (keep the original private)
+// from here on the agent uses `wallet`, never `walletClient` (keep the original private). Add extensions to the
+// guarded client, after guard(): `oathline.guard(walletClient).extend(publicActions)`. Since 0.6.3 a sending function
+// of an add-on installed before guard() is refused in enforce mode (it would hold the raw client).
 await wallet.sendTransaction({ to: '0x…', value: 1n })     // checked first, then sent
 ```
 
@@ -331,7 +354,7 @@ If this throws instead, see "When something goes wrong" below.
 
 | Wrapped object | Checked by sayso before signing | Follows the `signatures` policy (cannot be simulated) | Refused in enforce mode, reported in shadow mode (sayso cannot check them yet; since 0.4.0) |
 | --- | --- | --- | --- |
-| viem `guard(walletClient)` | `sendTransaction`, `writeContract`, `signTransaction`, `sendTransactionSync`, `writeContractSync` | `signTypedData`, `signMessage`; `request` with `personal_sign`, `eth_sign`, `eth_signTypedData*` | `sendCalls`, `sendCallsSync` (EIP-5792 batches), `sendRawTransaction`, `sendRawTransactionSync`, `deployContract`; `request` with `wallet_sendCalls`, `eth_sendRawTransaction`, `eth_sendTransaction`, `eth_signTransaction`, `wallet_grantPermissions`, `wallet_sendPreparedCalls`, `eth_sendUserOperation`; `signAuthorization` and an `authorizationList` (EIP-7702; refused in every mode unless `mode: 'shadow'` is written) |
+| viem `guard(walletClient)` | `sendTransaction`, `writeContract`, `signTransaction`, `sendTransactionSync`, `writeContractSync` | `signTypedData`, `signMessage`; `request` with `personal_sign`, `eth_sign`, `eth_signTypedData*` | `sendCalls`, `sendCallsSync` (EIP-5792 batches), `sendRawTransaction`, `sendRawTransactionSync`, `deployContract`; `request` with `wallet_sendCalls`, `eth_sendRawTransaction`, `eth_sendTransaction`, `eth_signTransaction`, `wallet_grantPermissions`, `wallet_sendPreparedCalls`, `eth_sendUserOperation`; `signAuthorization` and an `authorizationList` (EIP-7702; refused in every mode unless `mode: 'shadow'` is written); `switchChain`, `addChain`, and a checked call with a `chainId`, `chain` or `assertChainId: false` for another chain (0.6.3); **any other function the SDK does not know** (0.6.3): a new viem action, or an add-on's method installed before `guard()` (`execute` and `executeBatches` of ERC-7821, `grantPermissions` of ERC-7715, the OP Stack `initiateWithdrawal`, …) |
 | AgentKit `guardWalletProvider(provider)` | `sendTransaction`, `signTransaction`, `nativeTransfer` | `signTypedData`, `signMessage`, `sign`; `toSigner()` is refused in enforce mode unless `signatures: 'allow'` | `signAuthorization` and an `authorizationList`; on CDP, everything on `getClient()` but lookups (0.5.0); on Privy, `exportWallet()` when it carries the authorization key (0.5.0) |
 | either, on an **EIP-7702 wallet** (0.6.0; Kernel and the 32-byte rule 0.6.1) | a batch sent to the wallet's own code through `sendTransaction`: Calibur `execute(BatchedCall)` or ERC-7821 `execute(mode, calls)`, Kernel ERC-7579 `execute(mode, calls)` in the batch or single-call mode (checked call by call and as a whole by the server, at the pinned position); Calibur's `updateSalt`, `invalidateNonce`, `approveNative(x, 0)` (allowed by rules when nothing moves) | token permits, personal messages other than exactly 32 bytes (and `signMessage`) | refused in every mode but shadow, no policy, no hook: `sign` / `eth_sign` (blind hashes); `signMessage` / `personal_sign` of exactly 32 bytes (a Kernel user-operation hash); `signTypedData` / `eth_signTypedData*` when the typed data is under the wallet's own domain, Calibur's or Kernel's, a `SignedBatchedCall`, an `Enable` or `Kernel` type, an ERC-7739 `TypedDataSign` / `PersonalSign` wrapper, or a user operation (`ERC4337`, either EntryPoint); plus everything in the column to the left for plain wallets |
 
@@ -349,9 +372,19 @@ its `transport` gives out plain fields and a `request` shut like `request` above
 socket and the URL stay inside); viem's `token.transfer`, `token.approve` and their Sync variants are checked like
 `writeContract`, and any other function in a group of actions viem puts on the client is refused in enforce mode until
 sayso knows it (since 0.5.0). An extension added with `.extend(...)` sees the same guarded client.
+Since 0.6.3 every other top-level function of the guarded viem client is one of three kinds: one of the SDK's own (the
+table above); one that neither signs nor sends, from a fixed list (`CLIENT_READS` in `src/viem-known.ts`: viem 2.57.10's
+public actions but the two raw sends, the wallet client's reads and wallet-UI calls, the OP Stack L2 fee reads,
+`supportsExecutionMode`); or one added through the guarded client's `.extend(...)`. Anything else is refused in enforce
+mode and reported in shadow mode, so the next viem release that adds a sending action fails closed. An add-on installed
+after `guard()` that calls viem's sending code directly (ERC-7821's `execute` does) finds no account that signs and fails;
+one that sends through the client's own `sendTransaction` or `writeContract` is checked. A function added after `guard()`
+is trusted as it is: an extension must never be handed a function of the original client (keep that client private).
+Functions under symbols, in a `Map` or class instance, non-enumerable ones, an add-on's own `scope`, and a function
+under a `CLIENT_READS` name that is not viem's own (compared with the installed viem's source) are refused the same way.
 
 **Anything else passes straight through unchecked**: user operations (ERC-4337 smart accounts), or any other method of
-the wrapped object. Do not give those to the agent. The account object you created yourself (`privateKeyToAccount`)
+a wrapped AgentKit provider. Do not give those to the agent. The account object you created yourself (`privateKeyToAccount`)
 still signs by itself: keep it private, like the original client.
 Anything that signs through the original client or provider, or through a library you hand a raw key to (many x402
 payment clients do this), bypasses sayso.
