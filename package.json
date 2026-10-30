@@ -1,6 +1,6 @@
 {
   "name": "saysoio",
-  "version": "0.6.3",
+  "version": "0.7.0",
   "type": "module",
   "description": "Check every transaction an AI agent is about to sign against the owner's plain-language mandate: allow, ask or block, before it is signed. Shadow or enforce mode, fail closed. The SDK never holds keys.",
   "license": "MIT",
@@ -42,7 +42,7 @@
     }
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "peerDependencies": {
     "viem": "^2.30.0"

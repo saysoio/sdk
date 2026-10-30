@@ -74,7 +74,7 @@ export function newerViem(installed: string, tested: string = TESTED_VIEM): bool
 /** The warning for an installed viem newer than the newest the SDK was tested with; null when there is nothing to say. */
 export function untestedViemWarning(installed: string | null): string | null {
   if (!installed || !newerViem(installed)) return null
-  return `[sayso] viem ${installed} is newer than the newest viem this SDK was tested with (${TESTED_VIEM}). Wallet functions sayso does not know are refused in enforce mode and reported in shadow mode; look for a newer saysoio (npm install saysoio@latest).`
+  return `[sayso] viem ${installed} is newer than the newest viem this SDK was tested with (${TESTED_VIEM}). Wallet functions sayso does not know are refused (in shadow mode too) and reported; look for a newer saysoio (npm install saysoio@latest).`
 }
 
 let warned = false

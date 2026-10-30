@@ -9,6 +9,40 @@ explanation, and answers **allow**, **ask** or **block** with a one-line reason.
 This package wraps the agent's wallet so that check happens before anything is signed. It never sees or holds
 a key, and sayso never holds funds.
 
+**0.7.0: the SDK signs only on sayso's signed word for that very request.** Breaking for agents in shadow mode, so
+read this before you update. It needs sayso's servers from 31 Oct 2026 or later (the hosted ones are). What changed:
+
+- **Shadow mode stops when sayso cannot answer for the request.** A transaction goes ahead only on sayso's signed allow
+  for that exact transaction, or on sayso's signed "shadow" inside the answer to that same request. sayso's servers add
+  that signed mode to their error answers too (a `429`, a `5xx`, a check that ran out of time), so in shadow mode those
+  still go ahead. An error without it, a server that does not answer, or a check slower than `timeoutMs` is refused
+  (`OathlineUnavailable`), in shadow mode too. Nothing is remembered between requests, so `mode: 'shadow'` written in
+  code opens nothing on its own, except that it lets EIP-7702 authorizations through while sayso signs shadow; leave
+  `mode` out.
+- **`failClosed` is ignored.** `failClosed: false` used to let an unanswered check go ahead; it is accepted and does
+  nothing.
+- **`timeoutMs` defaults to 10 s** (it was 20 s), and a slower check is refused in every mode. sayso answers a check
+  that runs past 8 s with a signed "ask" that nobody can approve: the agent asks again a moment later. Keep `timeoutMs`
+  above 8000.
+- **Before the owner signs rules,** a wallet in shadow mode goes ahead and the owner sees "would have blocked: no rules
+  yet"; in enforce mode it is refused.
+- **Calls sayso cannot check** (batches, already signed transactions, signature requests) ask sayso for the mode
+  first, signed for that call (`POST /mode`), and are refused when it cannot answer. Breaking in shadow mode: until
+  0.6.3 they went ahead on the last mode the SDK had seen, even with sayso unreachable. Calls that must answer at once or that the SDK
+  does not know (a plain wallet function or provider method it does not know, a JSON-RPC method outside its list, a key
+  export) are refused in every mode.
+- **Gas fees are bounded in every mode** (`fees` option). Defaults: at most 4 times the base fee plus 2 gwei of
+  priority fee, at most 0.01 ETH of fee per transaction and 0.02 ETH per hour per wallet. Sends are signed first,
+  decoded, compared with the checked transaction and broadcast by the SDK; any difference is refused.
+- **EIP-7702 wallets:** an EIP-7702 authorization is refused, also through `toSigner()`, and in shadow mode too unless
+  `mode: 'shadow'` is written in code and sayso signs shadow for that call. A wallet the node shows as delegated keeps
+  refusing batches and blind hashes; an unsigned answer that calls it a plain wallet changes nothing.
+
+New: `refreshMode(wallet)` (the agent learns its mode without sending a transaction), `rotateApiKey` (the owner makes a
+new API key and the old one stops at once), a one-time warning when an `onAsk` hook is set and the wallet runs in
+enforce mode, the token and amount of Permit2 transfer permits in the owner's prompt, and README sections on Privy,
+Turnkey, batches and registering EIP-7702 wallets. Update with `npm install saysoio@latest`.
+
 **0.6.3: wallet functions sayso does not know are refused in enforce mode.** Until 0.6.2 the guarded viem client
 checked the functions it knew and let any other function through: a new viem action, or the method of an add-on
 installed with `.extend(...)` **before** `guard()`, which holds the raw client. viem's own ERC-7821 add-on
@@ -139,6 +173,9 @@ v2, Privy and Turnkey (see "Server wallets").
 - **The owner a wallet names first is permanent.** It cannot be changed later, so check the address.
 - **The owner must be a different wallet from the agent's.** An agent that is its own owner could sign its own rules
   and its own mode; `registerWallet`, the server and the dashboard's setup all refuse it (since 0.4.0).
+- **The agent must not hold or reach any other key**: not the owner's key, not a second wallet's key, not the raw key or
+  the provider credentials behind the wallet it uses. Anything the agent can sign with outside the guarded wallet is
+  not checked by sayso.
 
 ## Quickstart, part 1: the owner, on their own computer (about 5 minutes)
 
@@ -238,7 +275,7 @@ Then:
   the owner makes that call with the wallet's key outside the guard, with a prefix the wallet never used before.
 - **`sendCalls` stays refused in enforce mode** on every wallet, 7702 ones included: with `wallet_sendCalls` the
   wallet provider decides how the batch is executed, so the SDK cannot bind a verdict to the exact transaction. Send
-  the batch as the `execute(...)` self-call above instead, which sayso checks.
+  the batch as the `execute(...)` self-call above instead, which sayso checks (snippet below).
 - **Signatures that would hand the wallet over** are refused outright in enforce mode, with no policy and no hook
   (blind hashes; typed data under the wallet's own domain, Calibur's or Kernel's, a `SignedBatchedCall`, an ERC-7739
   `TypedDataSign` / `PersonalSign` wrapper, a user operation for either EntryPoint; and, since 0.6.1, a personal message of
@@ -255,6 +292,35 @@ Then:
   through the guarded client or the wallet app. A **user operation** the key signed earlier cannot be voided from the
   wallet: if this key ever signed one for someone you do not trust, use a fresh wallet. (Kernel: the same about user
   operations; and executors or fallback handlers from before registration cannot be listed, see above.)
+
+**A batch, instead of `sendCalls`.** Encode the calls as an ERC-7821 / ERC-7579 `execute(mode, calls)` and send it to the
+wallet's own address through the guarded client. The same bytes work on Calibur and on Kernel v3.3. The SDK exports no
+ABI for this yet, so declare it yourself:
+
+```ts
+import { encodeAbiParameters, encodeFunctionData, erc20Abi, parseAbi, parseAbiParameters, parseUnits } from 'viem'
+
+const EXECUTE = parseAbi(['function execute(bytes32 mode, bytes executionData) payable'])
+// the plain batch mode: a failing call reverts the whole batch (the "try" mode 0x0101… is refused)
+const BATCH = '0x0100000000000000000000000000000000000000000000000000000000000000'
+const CALLS = parseAbiParameters('(address to, uint256 value, bytes data)[]')
+
+const calls = [
+  { to: USDC, value: 0n, data: encodeFunctionData({ abi: erc20Abi, functionName: 'approve', args: [ROUTER, parseUnits('100', 6)] }) },
+  { to: ROUTER, value: 0n, data: swapCalldata },
+]
+const data = encodeFunctionData({ abi: EXECUTE, functionName: 'execute', args: [BATCH, encodeAbiParameters(CALLS, [calls])] })
+
+// to the wallet itself: each call is checked in the state the calls before it leave, then the batch as a whole
+await wallet.sendTransaction({ to: agentAccount.address, data })
+```
+
+At most 8 calls, none of them back into the wallet, its code contract or its EntryPoint. A batch sayso cannot check
+whole throws `OathlineBlocked` with `result.code` `batch-refused`; any other call into the wallet's own code throws it
+with `self-call`. `oathline.check(agentAccount.address, { to: agentAccount.address, data, value: 0n })` asks the same
+question without sending, but an allowed answer counts toward the owner's daily limits like a sent transaction, so do
+not check a batch and then send it as well. On a plain wallet (no EIP-7702 code) there is no checked batch: send the
+calls one by one.
 - **A plain wallet that is upgraded later** is refused at every check (`wallet-has-code`) until its owner registers it
   again as what it now is, with both signatures and nothing else changing:
 
@@ -266,6 +332,18 @@ await reregisterWallet(API, owner, agentAccount)      // → { kind: 'delegated'
 
 The same call registers an EIP-7702 wallet whose delegation was cleared as a plain wallet again. Rules, the Telegram
 chat, the mode switch and the API key stay; the owner's signature is good once and expires within the hour.
+
+**A lost or leaked API key.** The owner makes a new one; the old key stops working at once on every route, and the
+rules, the Telegram chat and the mode stay (dashboard: the wallet's page, "New API key"; or in code):
+
+```ts
+import { rotateApiKey } from 'saysoio'
+const { apiKey } = await rotateApiKey(API, owner, agentAddress)   // shown once: store it where the agent runs
+```
+
+The key is made on the owner's device and only its hash is signed and sent: sayso never sees it, and a copied signature
+installs a key only the owner holds. Make keys only with `rotateApiKey` (or the dashboard): sayso cannot check how random
+a key is. The owner's signature is good for 10 minutes and once only; a chat linked for the wallet is told.
 
 ## Quickstart, part 2: the agent (about 10 minutes)
 
@@ -282,6 +360,30 @@ const OWNER = '0xOwnerAddress'                                                  
 const { apiKey } = await registerWallet(API, agentAccount, OWNER, { chainId: 8453, invite: 'oi_…' })
 // shown once: store it as a secret, e.g. OATHLINE_API_KEY. Running this again is refused (409), it does not make a new key.
 ```
+
+**If the wallet runs code (EIP-7702).** The server reads the wallet's code before it registers it:
+
+- **No code** (a plain key-held account): registered as `kind: 'plain'`.
+- **An EIP-7702 delegation to Calibur or Kernel v3.3, on a server that accepts it, with nothing but the wallet's own key
+  able to act through it** (see "EIP-7702 wallets"): registered as `kind: 'delegated'`. The answer also carries
+  `caveat` (what sayso cannot see from before registration, such as batches the key signed earlier for a relayer) and
+  `checks` (the allowances it could read). Read both before you rely on enforce mode. The TypeScript type of
+  `registerWallet` declares only `apiKey` so far, so read the other fields like this:
+
+```ts
+const reg = await registerWallet(API, agentAccount, OWNER, { chainId: 8453, invite: 'oi_…' }) as {
+  apiKey: string; kind?: 'plain' | 'delegated'; delegate?: `0x${string}` | null; caveat?: string; checks?: string[]
+}
+if (reg.kind === 'delegated') console.log(`EIP-7702 wallet running ${reg.delegate}:`, reg.caveat, reg.checks)
+```
+
+- **Any other EIP-7702 delegation, an accepted one with an extra key, or a server with EIP-7702 wallets switched off:**
+  `registerWallet` throws (`sayso /wallets/register 400: this wallet cannot be registered: …`) with the reason, and
+  nothing is registered.
+- **Any other contract** is treated as a Safe and refused here: use `registerSafe` (see "Safe wallets").
+- **A plain wallet that gains code after it registered** is refused at every check (`wallet-has-code`) until the owner
+  runs `reregisterWallet` (see "EIP-7702 wallets"). An EIP-7702 wallet also needs saysoio 0.6.1 or newer on the agent,
+  or every check is refused (`sdk-too-old`).
 
 AgentKit, or any wallet you hold no raw key for (for example a CDP server wallet): pass the wallet provider in the
 account's place. Do this with the provider **before** you wrap it (a wrapped provider in enforce mode refuses to sign
@@ -314,9 +416,9 @@ const oathline = new Oathline({
   chainId: 8453,                 // Base: pin it; sayso's signing address for Base is built into the SDK
   // mode left out: the owner decides. Every wallet starts in shadow (logs only, never stops anything) until the owner
   // presses "Turn on enforce" on the wallet's page in the dashboard. mode: 'enforce' fixes enforce in code.
-  // Do not write mode: 'shadow': with it fixed in code, restarts, outages, signature requests and EIP-7702
-  // authorizations go through shadow even after the owner turned enforce on.
-  timeoutMs: 8000,               // shadow: the longest sayso may hold a transaction up; then it goes ahead
+  // Do not write mode: 'shadow': it opens nothing on its own (since 0.7.0); leave mode out.
+  // timeoutMs left at its default (10 s): a check that takes longer is refused in every mode (since 0.7.0), and
+  // sayso answers a slow check with a signed "ask" at 8 s, so a shorter timeout only adds refusals
   context: () => ({ reason: lastThought, inputs: lastSources }),   // optional: what your agent was thinking and read; treated as untrusted
   onDecision: (result, tx, decision) => console.log(`[sayso] ${decision} ${result.verdict}: ${result.reason}`),
 })
@@ -375,13 +477,54 @@ sayso knows it (since 0.5.0). An extension added with `.extend(...)` sees the sa
 Since 0.6.3 every other top-level function of the guarded viem client is one of three kinds: one of the SDK's own (the
 table above); one that neither signs nor sends, from a fixed list (`CLIENT_READS` in `src/viem-known.ts`: viem 2.57.10's
 public actions but the two raw sends, the wallet client's reads and wallet-UI calls, the OP Stack L2 fee reads,
-`supportsExecutionMode`); or one added through the guarded client's `.extend(...)`. Anything else is refused in enforce
-mode and reported in shadow mode, so the next viem release that adds a sending action fails closed. An add-on installed
+`supportsExecutionMode`); or one added through the guarded client's `.extend(...)`. Anything else is refused (next
+release: in shadow mode too, since it cannot ask sayso first; reported to sayso either way), so the next viem release
+that adds a sending action fails closed. The raw `request` door is an allow list too (since 0.7.0): reads pass, sends
+and signatures go through the gate, every other JSON-RPC method is refused (`wallet_switchEthereumChain` included: a wallet switched to another chain would sign for a chain sayso does not check); so is any function of a wrapped AgentKit
+provider the SDK does not know, and `toSigner()` hands out a signer whose every signature is gated. What is signed is what was checked (since 0.7.0): no option of the caller's (a `serializer`, a `chain` with its own serializers) reaches a signer, and every signed transaction is decoded and compared with the checked one before it is released or sent; on any difference it is refused. An add-on installed
 after `guard()` that calls viem's sending code directly (ERC-7821's `execute` does) finds no account that signs and fails;
 one that sends through the client's own `sendTransaction` or `writeContract` is checked. A function added after `guard()`
 is trusted as it is: an extension must never be handed a function of the original client (keep that client private).
 Functions under symbols, in a `Map` or class instance, non-enumerable ones, an add-on's own `scope`, and a function
 under a `CLIENT_READS` name that is not viem's own (compared with the installed viem's source) are refused the same way.
+
+**Gas fees (since 0.7.0).** sayso's check judges what a transaction does, not what it pays for gas, so the SDK bounds
+the fee itself: every signed transaction is decoded and refused, in every mode, when its priority fee is above 2 gwei,
+its `maxFeePerGas` (or `gasPrice`) is above 4 times the latest base fee read from the wallet's own node plus 2 gwei, gas
+× that fee is above 0.01 ETH, or the fees signed in the last hour (each counted at its maximum) would pass 0.02 ETH. On
+Base on 27 Oct 2026 the base fee was 0.005 gwei and the median priority fee 0.001 gwei, with the busiest 10% of
+transactions bidding up to about 2 gwei, so ordinary spikes pass. The refusal names the fee in gwei and the option to
+raise: `fees: { maxFeeMultiple, maxPriorityFeePerGas, maxFeeWei, hourlyFeeWei }`. A request that names a fee is bounded
+before it reaches the wallet, and one that names a fee but has no gas limit the SDK can estimate is refused. If the base
+fee cannot be read, only the 2 gwei allowance counts, so a node that hides it cannot raise the bound; a node that lies
+about it can raise the per-gas bound, never the per-transaction or hourly ceilings. The hourly count is kept per wallet
+(chain and address) and shared by every `Oathline` object in the process; each object applies its own `hourlyFeeWei` to
+that total. A fee counts once the signed bytes are released or broadcast (at its maximum, gas × max fee), and is given
+back when the node definitely refused the transaction (a JSON-RPC error such as "insufficient funds"); a lost answer, a
+timeout or "already known" keeps it counted. The count lives in memory, so a restart resets it; the per-transaction bound
+(`maxFeeWei`) still applies to every transaction. Fees do not count toward the owner's spending caps.
+**Not bounded by the SDK:** Base's L1 data fee, which is not part of the signed transaction. It grows with the size of
+the calldata (which sayso's check caps at 256 KB) and the fee on Ethereum; the GasPriceOracle's upper bound on 27 Oct
+2026 was about 0.0000000023 ETH for 200 bytes and 0.0000026 ETH at the 256 KB cap. Blob fees do not apply: Base takes
+no blob transactions, and the SDK passes no blob fields to a signer.
+
+**Sends (since 0.7.0).** A send is signed first and broadcast by the SDK: on a JSON-RPC wallet through
+`eth_signTransaction` then `eth_sendRawTransaction`; on an AgentKit provider through its `signTransaction` and its public
+client's `sendRawTransaction`. The signed bytes are decoded and compared with the checked transaction (and their fee
+bounded) before anything is broadcast. `nativeTransfer` takes the same path; the provider's own `nativeTransfer` is not
+called. **Providers whose `signTransaction` loses fields** fall back to their own `sendTransaction` with the checked,
+fee-bounded fields (and what they signed is never broadcast): AgentKit's `ViemWalletProvider` and `PrivyEvmWalletProvider`
+(built on it) keep only `to`, `value` and `data`, so viem cannot build the transaction; the legacy `CdpWalletProvider`
+returns a bare signature, not a signed transaction; the CDP smart-wallet providers cannot sign at all. The SDK sees this
+from the signer's error or by decoding the bytes (the same recipient, value, data and chain, but the position, gas or fee
+lost or replaced); once seen, that provider is not asked to sign again. A signature for another recipient, value, data or
+chain is not a lost field: it is refused. On this fallback the stock `ViemWalletProvider` drops the pinned position
+(nonce) and lets its node pick one, so sayso's receipt can name another position than the one signed; subclass it to
+sign every field (as the Break the guard game's `PinnedNonceProvider` does) if the receipt must match. **The remaining gap:** a wallet that cannot sign without sending (MetaMask and most browser wallets have no
+`eth_signTransaction`), and a provider with no `signTransaction` or no public client, are sent exactly the checked
+fields, with gas, fees, position and chain filled in and the fee bounded by the SDK first; what such a wallet then
+actually sends cannot be read back, so the SDK trusts it to send what it was given. Coinbase CDP's provider in
+particular sends through Coinbase's API, which picks the gas and fee itself (the agent cannot set them there).
 
 **Anything else passes straight through unchecked**: user operations (ERC-4337 smart accounts), or any other method of
 a wrapped AgentKit provider. Do not give those to the agent. The account object you created yourself (`privateKeyToAccount`)
@@ -410,12 +553,19 @@ provider to sign. sayso sits in front of that request the same way as for a plai
   (`createViemAccount`): `guard(createWalletClient({ account, … }))`. AgentKit's Privy *embedded* (delegated) provider:
   its internal doors to Privy's API (`executePrivyRequest`, `getPrivyHeaders`, `generatePrivySignature`) are refused in
   enforce mode on the wrapped provider.
+  **If the wallet has a Privy policy:** Privy's policy engine denies every method no rule allows. Allow
+  `eth_signTypedData_v4` (registration signs typed data; without it `registerWallet` fails with a Privy error, not a
+  sayso one) and the transaction method your path uses (`eth_signTransaction` for a viem account, `eth_sendTransaction`
+  for AgentKit's provider). The policy then applies on top of sayso's check.
 - **Turnkey.** `@turnkey/viem`'s account: `guard(createWalletClient({ account, … }))`, registered with
   `providerSigner(account)`.
+  **If a Turnkey policy needs a second approver (consensus):** sayso checks first; Turnkey then holds the signing
+  activity until the approver answers, and `@turnkey/viem` (0.5.0 and newer) throws `TurnkeyConsensusNeededError`. The
+  SDK passes that error through unchanged. Treat it as "waiting for the approver", not as a sayso block or an outage.
 
-**Before sayso has answered once** (after every restart), an agent with no `mode` in code treats these refusals as
-enforce: a CDP swap or a Privy export at start-up is refused even if the owner's switch is on shadow. Send one checked
-transaction first, or call `oathline.check(...)` once at start-up, so the SDK learns the owner's mode.
+**Calls sayso cannot check** (a CDP swap, a batch, a raw transaction) ask sayso for the owner's switch first (next
+release: `POST /mode`, signed for that call) and go ahead only when it says shadow. Calls that must answer at once and
+so cannot ask (a Privy key export, Privy's own API doors, an unknown plain function) are refused in every mode.
 `nativeTransfer` amounts are read as AgentKit 0.10 passes them: wei, as a whole-number string.
 
 **What still skips the guard, on every provider:** the provider's own API called with your API keys (`cdp.evm…`,
@@ -435,8 +585,8 @@ blocked"; under `'allow'` nothing is reported), so the owner's counts include th
 
 | Mode | allow | ask | block | sayso unreachable or too slow |
 | --- | --- | --- | --- | --- |
-| `shadow` | proceeds | proceeds, owner gets a notice | proceeds, owner gets a notice | proceeds |
-| `enforce` | proceeds | waits for the owner's answer in Telegram; without it, refused | refused (`OathlineBlocked`) | refused (`OathlineUnavailable`), unless `failClosed: false` |
+| `shadow` | proceeds | proceeds, owner gets a notice | proceeds, owner gets a notice | refused (`OathlineUnavailable`, since 0.7.0) |
+| `enforce` | proceeds | waits for the owner's answer in Telegram; without it, refused | refused (`OathlineBlocked`) | refused (`OathlineUnavailable`) |
 
 **Who picks the mode (since 0.3.0).** The owner does, from the dashboard: every wallet starts in shadow, and the owner
 turns enforce on (or back off) on the wallet's page with one signature. sayso refuses enforce until a Telegram chat is
@@ -445,33 +595,32 @@ next check (`oathline.mode` says which is in force) and keeps the last one it sa
 `mode` in the options is a floor: `mode: 'enforce'` keeps the agent in enforce whatever the switch says; the switch can
 raise `'shadow'` to enforce, never lower `'enforce'`. **Before 0.3.0, leaving `mode` out meant enforce.** If you relied
 on that, set `mode: 'enforce'` when you upgrade, or have the owner turn enforce on. Without an answer from sayso
-(sayso unreachable, and signature requests, which are not checked by sayso) the SDK uses the last mode it saw; before it
-has seen one, the mode written in code, and with none written, enforce, since the owner's switch may be on. The last
-mode seen is kept in memory only. An agent that only signs messages (x402, permits) and never sends a transaction does
-not learn the switch: give it `mode: 'enforce'` or a `signatures` policy. **Do not write `mode: 'shadow'` to start a
-trial:** leave `mode` out instead. With shadow fixed in code, every restart, every outage, every signature request and
-every EIP-7702 authorization goes through shadow until the first answer from sayso, even after the owner turned enforce
-on; with `mode` left out, all of those fail closed.
+(sayso unreachable, a refusal, a call sayso cannot check, a signature request) the SDK goes ahead only on sayso's
+**signed word for that very request** (since 0.7.0; decision of 27 Oct): a signed allow for the exact transaction, or
+a signed shadow inside the same answer, bound to the random nonce the SDK sent with it. Nothing is remembered across
+requests. Anything else is refused, **including during an outage in shadow mode**, a rate limit (the server answers a
+bare 429 once a wallet has had 30 signed refusals in a minute) and a check over the server's 256 KB body cap (refused
+before it is sent). `mode: 'shadow'` written in code and `failClosed: false` open nothing. A signature request, a batch
+or a raw transaction asks `POST /mode` first, signed for that call. `await oathline.refreshMode(walletAddress)` shows
+the owner's switch in `oathline.mode`; it never opens anything. **Do not write `mode: 'shadow'`:** leave `mode` out.
 
 What enforce mode protects against: it stops a **tricked** agent (a prompt injection, a poisoned page, a bad tool
 result). It does not stop a **hacked** agent server: whoever controls that server holds the agent's key and can sign
 without the SDK. For that, use a Safe with sayso as co-signer (below).
 
-**When sayso is down, the agent stops.** In enforce mode the SDK signs nothing it could not check: if the server
-cannot be reached, answers an error or takes longer than `timeoutMs`, the call throws `OathlineUnavailable` and no
-transaction leaves (`failClosed: true`, the default). That is on purpose: an agent that keeps trading while its check is
-away is unguarded exactly when something is wrong. If your team would rather keep going without a check than stop, say
-so explicitly with `failClosed: false`; the transaction then proceeds and `onDecision` is called with the reason
-("sayso unavailable …, failClosed=false"), so the gap is at least on your record. Shadow mode always proceeds.
-The opt-out covers outages only: a refusal by the server is a block (`OathlineBlocked`, since 0.6.0), and an answer
-that does not verify as sayso's is refused too, whatever `failClosed` says.
+**When sayso is down, the agent stops.** The SDK signs nothing it could not check: if the server cannot be reached,
+answers an error or takes longer than `timeoutMs`, the call throws `OathlineUnavailable` and no transaction leaves, in
+shadow mode too (since 0.7.0). That is on purpose: an
+agent that keeps trading while its check is away is unguarded exactly when something is wrong, and an agent could
+otherwise provoke the outage itself. `failClosed: false` is accepted and ignored since 0.7.0 (decision of
+27 Oct): it used to let an unanswered check go ahead in enforce mode.
 
 **Timeouts.** A check usually takes under a second to a few seconds: the transaction is simulated and, in unclear
 cases, a decision model is asked. On our benchmark the median was 1.2 s and 1 in 10 took 7.7 s or longer; it is
-slower when the server is busy. `timeoutMs` is how long one check may take (default 20000, i.e. 20 s). In shadow
-mode a slower check is skipped and the transaction goes ahead; in enforce mode it is refused with
-`OathlineUnavailable` (unless `failClosed: false`). So keep it short in shadow mode (8000 is
-fine) and longer in enforce mode (30000 is a good start). It does not include waiting for the owner's answer.
+slower when the server is busy. `timeoutMs` is how long one check may take (default 10000, i.e. 10 s, since 0.7.0;
+before it 20 s). A slower check is refused with `OathlineUnavailable` in every mode (since 0.7.0: in shadow mode too).
+The server answers a check that runs past 8 s with a signed "ask", so 10 s covers it with room for the network; do not
+set it lower. It does not include waiting for the owner's answer.
 
 **An "ask" holds the call open.** In enforce mode an "ask" goes to the owner's own Telegram chat with Approve and
 Reject buttons, and `sendTransaction` (or `writeContract`, …) does not return until the owner answers or the
@@ -489,7 +638,8 @@ has not linked Telegram, an "ask" is refused at once (`OathlineNeedsApproval`), 
   asked" so you can see how many there are before you switch; the content of the message never leaves the agent, only
   its kind, the counterparty and whom it favours.
 - `onAsk` runs next to the agent, so it is weaker than the owner's own Telegram chat; it is used for transaction
-  "asks" only when no chat is linked.
+  "asks" only when no chat is linked. In enforce mode its yeses bypass the owner's approval and the daily cap's asks,
+  so the SDK prints a one-time warning; link Telegram instead, and never write a hook that approves automatically.
 - Raise `timeoutMs` (see above) and your framework's tool timeout.
 
 ```ts
@@ -507,7 +657,8 @@ Catch `OathlineBlocked`, `OathlineNeedsApproval` and `OathlineUnavailable` in th
 | `sayso /wallets/register 403: registration is by invitation during the beta: an invite code is required` | No invite code was given | Pass `{ invite: 'oi_…' }` |
 | `sayso /mandates 403: this wallet is not registered, and during the beta leaving rules for it needs an invite code` | The owner signed rules before the agent registered, without the code | Pass `{ invite: 'oi_…' }` to `setMandate` too |
 | `… 403: that invite code is not valid or has been used up` | Wrong code, cancelled, or all its places are taken by other wallets | Check the code; ask [@saysoio](https://x.com/saysoio) for more places |
-| `… 409: this wallet is already registered …` | Registration ran a second time (for example from a deploy script) | Nothing to do: keep the API key from the first time. Register once, not on every deploy |
+| `… 409: this wallet is already registered …` | Registration ran a second time (for example from a deploy script) | Keep the API key from the first time; register once, not on every deploy. Key lost or leaked: the owner makes a new one with `rotateApiKey` |
+| `… 401: this API key was replaced: its owner made a new key …` | The owner made a new key (`rotateApiKey`); the old one is cancelled | Put the new key where the agent runs |
 | `… 409: this wallet is already linked to another owner` | Someone registered this wallet first, naming a different owner | That owner stays; use a new agent wallet |
 | `… 400: this wallet is a contract (a Safe) …` | The agent wallet has contract code that is not an EIP-7702 delegation | Use a plain key-held wallet, or the Safe path |
 | `… 400: this wallet cannot be registered: it is an EIP-7702 wallet … this server does not accept EIP-7702 wallets at the moment` | The wallet is upgraded with EIP-7702 and the server has `OATHLINE_7702_WALLETS` off | Use a plain wallet, or ask the operator; sayso's own servers have it off until the security review |
@@ -524,8 +675,8 @@ Catch `OathlineBlocked`, `OathlineNeedsApproval` and `OathlineUnavailable` in th
 | `OathlineBlocked` … `refused by sayso (check API 401): missing or unknown API key` | The key is wrong, or the wallet was never registered (since 0.6.0 a block, not an outage: `failClosed: false` does not cover it) | Check `OATHLINE_API_KEY`; register the wallet |
 | `OathlineBlocked` … `refused by sayso (check API 403): this API key belongs to a different wallet` | The key is for another agent wallet | Use each wallet's own key |
 | `OathlineBlocked` … `refused by sayso (check API 409): no owner-signed mandate is registered for this wallet` | The owner has not signed rules for this exact address yet | The owner does part 1 for this address |
-| `check API 429` … `too many requests for this API key` | Rate limits: about 60 checks a minute per API key | Retry after the `retry-after` seconds |
-| `check API 503` … `the check server is busy` | The simulation queue is full | Retry after the `retry-after` seconds (shadow mode proceeds on its own) |
+| `check API 429` … `too many requests for this API key` | Rate limits: about 60 checks a minute per API key | Retry after the `retry-after` seconds (refused in shadow mode too, since 0.7.0, unless sayso signs shadow onto the answer) |
+| `check API 503` … `the check server is busy` | The simulation queue is full | Retry after the `retry-after` seconds (since 0.7.0: refused in shadow mode too unless sayso signs shadow onto the answer) |
 | `check API 503` … `the fork does not answer; nothing can be checked right now` | sayso's copy of the chain is down or restarting | Retry in a minute; if it lasts, tell [@saysoio](https://x.com/saysoio) |
 | `receipt signature is not from sayso` | The server's signer is not the one built into the SDK | Check the `apiUrl` and `chainId` |
 

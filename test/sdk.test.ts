@@ -1,11 +1,11 @@
-import { test, before, after } from 'node:test'
+import { test, before, after, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer, type Server } from 'node:http'
 import { createWalletClient, custom, encodeFunctionData, fallback, parseAbi, publicActions, parseEther, parseTransaction, walletActions, type Address, type Hex } from 'viem'
 import { privateKeyToAccount, generatePrivateKey } from 'viem/accounts'
 import { sendTransaction as sendTransactionAction, signMessage as signMessageAction } from 'viem/actions'
 import { base, baseSepolia } from 'viem/chains'
-import { Oathline, OathlineBlocked, OathlineNeedsApproval, OathlineUnavailable, OATHLINE_DOMAIN, OATHLINE_TYPES, OATHLINE_SIGNERS, OATHLINE_COSIGNERS, SDK_VERSION, officialSigner, txDigest } from '../src/index.js'
+import { Oathline, OathlineBlocked, OathlineNeedsApproval, OathlineUnavailable, OATHLINE_DOMAIN, OATHLINE_TYPES, OATHLINE_SIGNERS, OATHLINE_COSIGNERS, SDK_VERSION, officialSigner, txDigest, modeQueryDigest } from '../src/index.js'
 import { readFileSync } from 'node:fs'
 import { isAddress } from 'viem'
 import { erc7821Actions, erc7715Actions } from 'viem/experimental'
@@ -16,6 +16,7 @@ import { CLIENT_READS, TESTED_VIEM, installedViem, newerViem, untestedViemWarnin
 const ATTACKER: Address = '0x2222222222222222222222222222222222222222'
 const ASKER: Address = '0x4444444444444444444444444444444444444444'
 const HELD: Address = '0x7777777777777777777777777777777777777777'    // an ask held on the position side
+const LATE: Address = '0x8888888888888888888888888888888888888888'    // R13b: an ask because the check ran out of time
 const SAVED: Address = '0x3333333333333333333333333333333333333333'
 
 // Fake check API: verdict by destination, with a properly signed receipt. Records what it was asked.
@@ -30,32 +31,58 @@ let kindLookups = 0
 const requests: any[] = []
 const authSeen: Array<string | undefined> = []
 const reports: any[] = []                                           // what the SDK let through unchecked in shadow mode (step 2d, fix 7)
+// Review round 4 (27 Oct): the owner's switch as this fake server signs it. null = a server that signs no mode (older
+// than 0.3.0): then nothing is ever let through without a signed allow, `mode: 'shadow'` in code included.
+let ownerSwitch: 'shadow' | 'enforce' | null = null
+const signMode = async (wallet: Address, txDigestHex: Hex) => {
+  const now = Math.floor(Date.now() / 1000), m = { wallet: wallet, txDigest: txDigestHex, mode: ownerSwitch!, setAt: 1, expiresAt: now + 120 }
+  return { ...m, signer: SIGNER, signature: await serverAccount.signTypedData({ domain: OATHLINE_DOMAIN, types: OATHLINE_TYPES, primaryType: 'ModeStatement', message: { ...m, setAt: 1n, expiresAt: BigInt(m.expiresAt) } }) }
+}
+/** runs fn with the fake server signing the owner's switch as `mode` */
+async function withSwitch<T>(mode: 'shadow' | 'enforce', fn: () => Promise<T>): Promise<T> { const was = ownerSwitch; ownerSwitch = mode; try { return await fn() } finally { ownerSwitch = was } }
 before(async () => {
   server = createServer((req, res) => {
     let body = ''; req.on('data', c => body += c); req.on('end', async () => {
       if (req.method === 'GET' && req.url === '/health') { res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify({ ok: true, chainId: healthChain, signer: SIGNER })) }   // names its chain, and its OWN key as the signer
       if (req.method === 'GET' && /^\/wallets\/0x[0-9a-fA-F]{40}$/.test(req.url ?? '')) { kindLookups++; const w = req.url!.slice(9).toLowerCase(); res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify({ wallet: w, registered: true, kind: walletKinds[w] ?? 'plain' })) }
       if (failNext) { failNext = false; res.statusCode = 500; return res.end('boom') }
-      if (refuseNext && req.url === '/check') { const r = refuseNext; refuseNext = null; res.statusCode = r.status; for (const [k, v] of Object.entries(r.headers ?? {})) res.setHeader(k, v); res.setHeader('content-type', 'application/json'); return res.end(r.body) }
+      if (refuseNext && req.url === '/check') {
+        const r = refuseNext; refuseNext = null; res.statusCode = r.status; for (const [k, v] of Object.entries(r.headers ?? {})) res.setHeader(k, v); res.setHeader('content-type', 'application/json')
+        // a real server signs the owner's switch onto every refusal, for the request's nonce (review rounds 4 and 5)
+        const n = req.headers['x-sayso-nonce'], asked = (() => { try { return JSON.parse(body).wallet } catch { return null } })()
+        if (ownerSwitch && typeof n === 'string' && asked) { try { return res.end(JSON.stringify({ ...JSON.parse(r.body), mode: await signMode(asked, modeQueryDigest(asked, n as Hex, healthChain)) })) } catch { /* not JSON */ } }
+        return res.end(r.body)
+      }
       authSeen.push(req.headers.authorization)
       if (req.headers.authorization !== `Bearer ${KEY}`) { res.statusCode = 401; return res.end('{"error":"missing or unknown API key"}') }
       if (req.method === 'POST' && req.url === '/unchecked') { reports.push(JSON.parse(body)); res.setHeader('content-type', 'application/json'); return res.end('{"ok":true}') }
+      if (req.method === 'POST' && req.url === '/mode') {
+        res.setHeader('content-type', 'application/json')
+        if (!ownerSwitch) { res.statusCode = 404; return res.end('{"error":"not found"}') }
+        const { nonce, wallet: w } = JSON.parse(body) as { nonce: Hex; wallet: Address }   // a real server answers for its key's wallet
+        return res.end(JSON.stringify({ wallet: w, mode: await signMode(w, modeQueryDigest(w, nonce, healthChain)), rules: true }))
+      }
+      if (req.url !== '/check') { res.statusCode = 404; return res.end('{"error":"not found"}') }
       const j = JSON.parse(body); requests.push(j)
       const to = (j.tx.to as string).toLowerCase()
-      const verdict = to === ATTACKER.toLowerCase() ? 'block' : to === ASKER.toLowerCase() || to === HELD.toLowerCase() ? 'ask' : 'allow'
+      const verdict = to === ATTACKER.toLowerCase() ? 'block' : to === ASKER.toLowerCase() || to === HELD.toLowerCase() || to === LATE.toLowerCase() ? 'ask' : 'allow'
       const now = Math.floor(Date.now() / 1000)
       const digest = txDigest({ wallet: j.wallet, to: tamper === 'other-tx' ? ATTACKER : j.tx.to, data: j.tx.data, value: j.tx.value !== undefined ? BigInt(j.tx.value) : undefined, nonce: tamper === 'other-nonce' ? (j.tx.nonce ?? 0) + 1 : j.tx.nonce })
       const r = { wallet: j.wallet as Address, txDigest: digest, mandateId: `0x${'ab'.repeat(32)}` as Hex, verdict, issuedAt: now, expiresAt: now + 120 }
       const signer = tamper === 'bad-sig' ? privateKeyToAccount(generatePrivateKey()) : serverAccount
       const signature = await signer.signTypedData({ domain: OATHLINE_DOMAIN, types: OATHLINE_TYPES, primaryType: 'Verdict', message: { ...r, issuedAt: BigInt(r.issuedAt), expiresAt: BigInt(r.expiresAt) } })
       res.setHeader('content-type', 'application/json')
-      res.end(JSON.stringify({ verdict, reason: `fake: ${verdict}`, rules: to === HELD.toLowerCase() ? [{ id: 'position-pending', verdict: 'ask', reason: 'held: an earlier allowed call is not yet on the chain' }] : [], walletKind: walletKinds[String(j.wallet).toLowerCase()] ?? 'plain', ...(tamper === 'no-receipt' ? {} : { receipt: { ...r, signer: SIGNER, signature } }) }))
+      const mode = ownerSwitch ? await signMode(j.wallet, digest) : undefined
+      const n = req.headers['x-sayso-nonce']
+      const modeNonce = ownerSwitch && verdict !== 'allow' && typeof n === 'string' ? await signMode(j.wallet, modeQueryDigest(j.wallet, n as Hex, healthChain)) : undefined
+      res.end(JSON.stringify({ verdict, reason: `fake: ${verdict}`, ...(mode ? { mode } : {}), ...(modeNonce ? { modeNonce } : {}), rules: to === HELD.toLowerCase() ? [{ id: 'position-pending', verdict: 'ask', reason: 'held: an earlier allowed call is not yet on the chain' }] : to === LATE.toLowerCase() ? [{ id: 'check-deadline', verdict: 'ask', reason: 'check took too long' }] : [], walletKind: walletKinds[String(j.wallet).toLowerCase()] ?? 'plain', ...(tamper === 'no-receipt' ? {} : { receipt: { ...r, signer: SIGNER, signature } }) }))
     })
   })
   await new Promise<void>(r => server.listen(0, '127.0.0.1', r))
   apiUrl = `http://127.0.0.1:${(server.address() as any).port}`
 })
 after(() => server.close())
+afterEach(() => { ownerSwitch = null })
 
 const fakeProvider = () => {
   const sent: any[] = []
@@ -69,7 +96,7 @@ test('enforce: allow proceeds, block throws and nothing is sent', async () => {
   await assert.rejects(() => g.sendTransaction({ to: ATTACKER, data: '0x' }), OathlineBlocked)
   assert.equal(p.sent.length, 1)
   assert.deepEqual(decisions, ['signed', 'refused'])
-  assert.equal(g.other(), 'passthrough')
+  assert.throws(() => (g as any).other(), OathlineBlocked)   // round 6: a provider function the SDK does not know is refused
 })
 
 test('enforce: ask waits for the owner; refused by default, proceeds when approved', async () => {
@@ -87,13 +114,14 @@ test('enforce fails closed when the API is down; shadow proceeds', async () => {
   await assert.rejects(() => new Oathline({ mode: 'enforce', apiUrl, apiKey: KEY, signer: SIGNER }).guardWalletProvider(p).sendTransaction({ to: SAVED, data: '0x' }), OathlineUnavailable)
   assert.equal(p.sent.length, 0)
   const decisions: string[] = []
+  ownerSwitch = 'shadow'                                       // sayso signs shadow for this request (modeNonce)
   const shadow = new Oathline({ apiUrl, apiKey: KEY, signer: SIGNER, mode: 'shadow', onDecision: (_r, _t, d) => decisions.push(d) }).guardWalletProvider(p)
   await shadow.sendTransaction({ to: ATTACKER, data: '0x' })   // blocked verdict, but shadow only logs
   assert.equal(p.sent.length, 1)
   assert.deepEqual(decisions, ['shadow'])
 })
 
-test('stop when sayso is down (step 8): enforce mode refuses to sign when the server cannot be reached at all; failClosed: false is the opt-out', async () => {
+test('stop when sayso is down (step 8; decision 27 Oct): nothing signs when the server cannot be reached, `failClosed: false` and `mode: \'shadow\'` included', async () => {
   // a port nobody listens on: the connection is refused, there is no answer to misread
   const probe = createServer(); await new Promise<void>(r => probe.listen(0, '127.0.0.1', r))
   const dead = `http://127.0.0.1:${(probe.address() as any).port}`; await new Promise<void>(r => probe.close(() => r()))
@@ -103,14 +131,12 @@ test('stop when sayso is down (step 8): enforce mode refuses to sign when the se
   await assert.rejects(() => strict.nativeTransfer(SAVED, '1'), OathlineUnavailable)
   assert.equal(p.sent.length, 0)
   assert.deepEqual(decisions.map(d => d[0]), ['refused', 'refused']); assert.match(decisions[0][1], /check unavailable/)
-  // the team's opt-out, spelled out: the transaction goes ahead and the decision says why
+  // the old opt-out no longer opens the gate (decision 27 Oct, Artem): only a fresh signed shadow does
   const optOut = new Oathline({ mode: 'enforce', apiUrl: dead, apiKey: KEY, signer: SIGNER, timeoutMs: 2000, failClosed: false, onDecision: (r, _t, d) => decisions.push([d, r.reason]) }).guardWalletProvider(p)
-  await optOut.sendTransaction({ to: SAVED, data: '0x' })
-  assert.equal(p.sent.length, 1)
-  assert.equal(decisions.at(-1)![0], 'shadow'); assert.match(decisions.at(-1)![1], /sayso unavailable .*failClosed=false/)
-  // shadow mode never needed the opt-out
-  await new Oathline({ apiUrl: dead, apiKey: KEY, signer: SIGNER, mode: 'shadow', timeoutMs: 2000 }).guardWalletProvider(p).sendTransaction({ to: SAVED, data: '0x' })
-  assert.equal(p.sent.length, 2)
+  await assert.rejects(() => optOut.sendTransaction({ to: SAVED, data: '0x' }), OathlineUnavailable)
+  // nor does shadow written in code, with no signed shadow from sayso
+  await assert.rejects(() => new Oathline({ apiUrl: dead, apiKey: KEY, signer: SIGNER, mode: 'shadow', timeoutMs: 2000 }).guardWalletProvider(p).sendTransaction({ to: SAVED, data: '0x' }), OathlineUnavailable)
+  assert.equal(p.sent.length, 0)
 })
 
 test('R5 part 2 (security desk F2): a refusal by the server is a block, not an outage, whatever failClosed says; outages stay outages', async () => {
@@ -139,7 +165,7 @@ test('R5 part 2 (security desk F2): a refusal by the server is a block, not an o
     assert.ok(decisions.every(d => d[0] === 'refused' && d[1] === 'block'), JSON.stringify(decisions))
     assert.match(decisions[0][2], /refused by sayso \(check API 409\)/)
   }
-  // outages are still outages: a 5xx, a "try again" answer (429 with retry-after) and a dead server; the opt-out covers those
+  // outages are still outages: a 5xx, a "try again" answer (429 with retry-after) and a dead server
   const p = fakeProvider()
   const strict = new Oathline({ mode: 'enforce', apiUrl, apiKey: KEY, signer: SIGNER }).guardWalletProvider(p)
   failNext = true
@@ -149,47 +175,53 @@ test('R5 part 2 (security desk F2): a refusal by the server is a block, not an o
   refuseNext = { status: 503, body: '{"error":"the check server is busy; try again in a few seconds"}', headers: { 'retry-after': '5' } }
   await assert.rejects(() => strict.sendTransaction({ to: SAVED, data: '0x' }), OathlineUnavailable)
   assert.equal(p.sent.length, 0)
+  // `failClosed: false` no longer covers them (decision 27 Oct, Artem)
   const optOut = new Oathline({ mode: 'enforce', apiUrl, apiKey: KEY, signer: SIGNER, failClosed: false }).guardWalletProvider(p)
   failNext = true
-  await optOut.sendTransaction({ to: SAVED, data: '0x' })
+  await assert.rejects(() => optOut.sendTransaction({ to: SAVED, data: '0x' }), OathlineUnavailable)
   refuseNext = { status: 429, body: '{"error":"too many requests"}', headers: { 'retry-after': '12' } }
-  await optOut.sendTransaction({ to: SAVED, data: '0x' })
-  assert.equal(p.sent.length, 2)
+  await assert.rejects(() => optOut.sendTransaction({ to: SAVED, data: '0x' }), OathlineUnavailable)
+  assert.equal(p.sent.length, 0)
   // a receipt or a mode statement that does not verify is never covered by the opt-out either (a forged "allow" must not sign)
   for (const t of ['other-tx', 'bad-sig', 'no-receipt'] as const) {
     tamper = t
     await assert.rejects(() => optOut.sendTransaction({ to: SAVED, data: '0x', value: 1n }), OathlineUnavailable, `tamper: ${t}`)
   }
   tamper = 'none'
-  assert.equal(p.sent.length, 2)
-  // shadow mode never stops anything: a refusal goes ahead, the decision says shadow, and sayso is told so the owner sees "would have blocked"
+  assert.equal(p.sent.length, 0)
+  // in shadow mode (sayso's signed shadow, fresh) a refusal goes ahead, the decision says shadow, and sayso is told so the owner sees "would have blocked"
   reports.length = 0
   const shadowLog: Array<[string, string]> = []
-  const shadow = new Oathline({ apiUrl, apiKey: KEY, signer: SIGNER, mode: 'shadow', onDecision: (r, _t, d) => shadowLog.push([r.verdict, d]) }).guardWalletProvider(p)
-  refuseNext = { status: 409, body: '{"error":"this is a call into the wallet\'s own EIP-7702 code","code":"self-call"}' }
-  await shadow.sendTransaction({ to: SAVED, data: '0x' })
-  assert.equal(p.sent.length, 3); assert.deepEqual(shadowLog, [['block', 'shadow']])
+  await withSwitch('shadow', async () => {
+    const shadow = new Oathline({ apiUrl, apiKey: KEY, signer: SIGNER, onDecision: (r, _t, d) => shadowLog.push([r.verdict, d]) }).guardWalletProvider(p)
+    await shadow.sendTransaction({ to: SAVED, data: '0x' })                                   // sayso says shadow, signed
+    refuseNext = { status: 409, body: '{"error":"this is a call into the wallet\'s own EIP-7702 code","code":"self-call"}' }
+    await shadow.sendTransaction({ to: SAVED, data: '0x' })
+  })
+  assert.equal(p.sent.length, 2); assert.deepEqual(shadowLog, [['allow', 'shadow'], ['block', 'shadow']])
   for (let i = 0; i < 50 && reports.length < 1; i++) await new Promise(r => setTimeout(r, 20))
   assert.equal(reports[0]?.kind, 'refused by sayso (self-call)'); assert.match(reports[0]?.detail ?? '', /EIP-7702 code/)
 })
 
-test('R5 part 2 (review 2026-10-22, M1 and L3): a refusal that says the wallet runs code teaches the SDK its kind, so a blind hash and toSigner() are refused from then on, whatever the signatures policy', async () => {
+test('R5 part 2 (review 2026-10-22, M1 and L3): a refusal that says the wallet runs code teaches the SDK its kind, so a blind hash, on the provider or its signer, is refused from then on, whatever the signatures policy', async () => {
   const signed: string[] = []
-  const p = { getAddress: () => SAVED, sendTransaction: async (_tx?: any) => '0x1' as Hex, sign: async (_h?: any) => { signed.push('raw'); return '0xsig' as Hex }, toSigner: () => 'the raw signer' }
+  const p = { getAddress: () => SAVED, sendTransaction: async (_tx?: any) => '0x1' as Hex, sign: async (_h?: any) => { signed.push('raw'); return '0xsig' as Hex }, toSigner: () => ({ address: SAVED, sign: async (_h?: any) => { signed.push('signer-raw'); return '0xsig' as Hex } }) }
   const decisions: string[] = []
   const g = new Oathline({ mode: 'enforce', apiUrl, apiKey: KEY, signer: SIGNER, signatures: 'allow', onDecision: (r, _t, d) => decisions.push(`${d}:${r.verdict}`) }).guardWalletProvider(p)
-  assert.equal(g.toSigner(), 'the raw signer', 'kind unknown and signatures: allow: the policy applies, as before')
+  assert.equal(g.toSigner().address, SAVED, 'round 6: a gated signer, in every mode')
   refuseNext = { status: 409, body: '{"error":"this wallet now runs code (an EIP-7702 delegation or a contract) but is registered as a plain wallet","code":"wallet-has-code"}' }
   await assert.rejects(() => g.sendTransaction({ to: SAVED, data: '0x' }), OathlineBlocked)
   await assert.rejects(() => g.sign('0xabc'), (e: any) => e instanceof OathlineBlocked && /EIP-7702/.test(e.message) && /blind/.test(e.message))
-  assert.throws(() => g.toSigner(), (e: any) => e instanceof OathlineBlocked && /EIP-7702/.test(e.message))
+  await assert.rejects(() => g.toSigner().sign('0xabc'), (e: any) => e instanceof OathlineBlocked && /EIP-7702/.test(e.message))
   assert.deepEqual(signed, [], 'nothing reached the provider')
   assert.deepEqual(decisions, ['refused:block', 'refused:block', 'refused:block'])
-  // in shadow mode the export goes ahead (shadow stops nothing)
-  const sh = new Oathline({ apiUrl, apiKey: KEY, signer: SIGNER, mode: 'shadow' }).guardWalletProvider(p)
-  refuseNext = { status: 409, body: '{"error":"this wallet now runs code","code":"wallet-has-code"}' }
-  await sh.sendTransaction({ to: SAVED, data: '0x' })
-  assert.equal(sh.toSigner(), 'the raw signer')
+  // in shadow mode the refusal goes ahead (sayso signs shadow onto it), and the signer handed out is gated
+  await withSwitch('shadow', async () => {
+    const sh = new Oathline({ apiUrl, apiKey: KEY, signer: SIGNER }).guardWalletProvider(p)
+    refuseNext = { status: 409, body: '{"error":"this wallet now runs code","code":"wallet-has-code"}' }
+    await sh.sendTransaction({ to: SAVED, data: '0x' })
+    assert.equal(sh.toSigner().address, SAVED)                                         // round 6: a gated signer, in shadow too
+  })
 })
 
 test('the agent sends its API key and context — never a mandate or an owner instruction; nativeTransfer is gated too', async () => {
@@ -241,19 +273,20 @@ test('viem wallet client: sendTransaction and writeContract are gated', async ()
 
 test('signature requests are gated: refused by default, allowed by the owner hook, logged in shadow', async () => {
   const signed: string[] = []
-  const provider = { getAddress: () => SAVED, sendTransaction: async () => '0x1' as Hex, signTypedData: async (_td?: any) => { signed.push('typed'); return '0xsig' as Hex }, signMessage: async (_m?: any) => { signed.push('msg'); return '0xsig' as Hex }, sign: async (_h?: any) => { signed.push('raw'); return '0xsig' as Hex }, toSigner: () => 'signer' }
+  const provider = { getAddress: () => SAVED, sendTransaction: async () => '0x1' as Hex, signTypedData: async (_td?: any) => { signed.push('typed'); return '0xsig' as Hex }, signMessage: async (_m?: any) => { signed.push('msg'); return '0xsig' as Hex }, sign: async (_h?: any) => { signed.push('raw'); return '0xsig' as Hex }, toSigner: () => ({ address: SAVED, signMessage: async (_m?: any) => { signed.push('signer-msg'); return '0xsig' as Hex } }) }
   const permit = { primaryType: 'Permit', domain: { name: 'USD Coin' }, message: { spender: ATTACKER, value: '1000000000' } }
   const enforce = new Oathline({ mode: 'enforce', apiUrl, apiKey: KEY, signer: SIGNER }).guardWalletProvider(provider)
   await assert.rejects(() => enforce.signTypedData(permit), OathlineNeedsApproval)
   await assert.rejects(() => enforce.signMessage('hi'), OathlineNeedsApproval)
   await assert.rejects(() => enforce.sign('0xabc'), OathlineNeedsApproval)
-  assert.throws(() => enforce.toSigner(), OathlineNeedsApproval)
+  await assert.rejects(() => enforce.toSigner().signMessage('hi'), OathlineNeedsApproval)
   assert.equal(signed.length, 0)
   let asked = ''
   const approved = new Oathline({ mode: 'enforce', apiUrl, apiKey: KEY, signer: SIGNER, onAsk: async r => { asked = r.reason; return true } }).guardWalletProvider(provider)
   await approved.signTypedData(permit)
   assert.match(asked, /Permit for USD Coin, in favour of 0x2222/)
   const decisions: string[] = []
+  ownerSwitch = 'shadow'                                                              // shadow: sayso's signed word (asked before each signature)
   const shadow = new Oathline({ apiUrl, apiKey: KEY, signer: SIGNER, mode: 'shadow', onDecision: (_r, _t, d) => decisions.push(d) }).guardWalletProvider(provider)
   await shadow.signMessage('hi')
   assert.deepEqual(signed, ['typed', 'msg']); assert.deepEqual(decisions, ['shadow'])
@@ -267,6 +300,7 @@ test('R5 part 2 (security desk F3): in shadow mode a signature request is report
   const permit = { primaryType: 'Permit', domain: { name: 'USD Coin' }, message: { spender: ATTACKER, value: '1000000000' } }
   const wait = async (n: number) => { for (let i = 0; i < 50 && reports.length < n; i++) await new Promise(r => setTimeout(r, 20)) }
   await new Promise(r => setTimeout(r, 100)); reports.length = 0                      // let reports from earlier tests land first
+  ownerSwitch = 'shadow'
   const asking = new Oathline({ apiUrl, apiKey: KEY, signer: SIGNER, mode: 'shadow' }).guardWalletProvider(provider)
   await asking.signTypedData(permit); await asking.signMessage('hi'); await asking.sign('0xabc')
   await wait(3)
@@ -320,6 +354,7 @@ test('R5 part 2 (review M1): on an EIP-7702 wallet the SDK refuses outright, nev
   assert.match(asked, /PermitSingle for Permit2, in favour of 0x2222.*ERC20ETH.*ETH/)
   // 2. shadow: the dangerous ones go ahead, and each is reported as "would have blocked" on an EIP-7702 wallet
   await new Promise(r => setTimeout(r, 100)); reports.length = 0; signed.length = 0
+  ownerSwitch = 'shadow'
   const sh = new Oathline({ apiUrl, apiKey: KEY, signer: SIGNER, mode: 'shadow' }).guardWalletProvider(provider(CALIBUR_WALLET))
   await sh.sign('0xabc'); for (const td of dangerous) await sh.signTypedData(td); await sh.signTypedData(usdcPermit)
   for (let i = 0; i < 50 && reports.length < 7; i++) await new Promise(r => setTimeout(r, 20))
@@ -382,10 +417,10 @@ test('the wallet\'s own chain must be the chain the server answers for (review o
     // an AgentKit-style provider that knows its network is held to the same rule
     const provider = { getAddress: () => SAVED, getNetwork: () => ({ chainId: '8453' }), sendTransaction: async (_tx: unknown) => '0xabc' as Hex }
     await assert.rejects(() => new Oathline({ mode: 'enforce', apiUrl: lying, apiKey: KEY, signer: SIGNER }).guardWalletProvider(provider).sendTransaction({ to: SAVED, data: '0x' }), OathlineUnavailable)
-    // shadow mode never stops anything, but it says what is wrong
+    // shadow written in code no longer lets it through without sayso's signed shadow (decision 27 Oct); it says what is wrong
     const shadow: string[] = []
-    await new Oathline({ apiUrl: lying, apiKey: KEY, signer: SIGNER, mode: 'shadow', onDecision: (r) => shadow.push(r.reason) }).guard(onBase).sendTransaction({ to: SAVED, value: 1n, ...fees })
-    assert.equal(raw.length, 1); assert.match(shadow[0], /chain 8453.*chain 84532/)
+    await assert.rejects(() => new Oathline({ apiUrl: lying, apiKey: KEY, signer: SIGNER, mode: 'shadow', onDecision: (r) => shadow.push(r.reason) }).guard(onBase).sendTransaction({ to: SAVED, value: 1n, ...fees }), OathlineUnavailable)
+    assert.equal(raw.length, 0); assert.match(shadow[0], /chain 8453.*chain 84532/)
     // a wallet client that really is on the test network matches a test-network server (its verdicts are still checked as before)
     const onSepolia = createWalletClient({ account, chain: baseSepolia, transport })
     await assert.rejects(() => new Oathline({ mode: 'enforce', apiUrl: lying, apiKey: KEY, signer: SIGNER }).guard(onSepolia).sendTransaction({ to: SAVED, value: 1n, ...fees }), /receipt is for a different transaction/)   // the fake signs Base digests: refused for that reason, not for the chain
@@ -438,9 +473,23 @@ test('EIP-7702 (third review H2): an authorization list is refused before any ch
   await assert.rejects(() => guarded.sendTransaction({ to: SAVED, value: 1n, nonce: 0, gas: 60000n, maxFeePerGas: 2n, maxPriorityFeePerGas: 1n, authorizationList: auth }), OathlineBlocked)
   assert.equal(requests.length, before)
   const shadowLog: Array<[string, string]> = []
-  const shadow = new Oathline({ apiUrl, apiKey: KEY, signer: SIGNER, mode: 'shadow', onDecision: (r, _t, d) => shadowLog.push([r.verdict, d]) }).guardWalletProvider(fakeProvider())
+  ownerSwitch = 'shadow'
+  const shadowSdk = new Oathline({ apiUrl, apiKey: KEY, signer: SIGNER, mode: 'shadow', onDecision: (r, _t, d) => shadowLog.push([r.verdict, d]) })
+  await shadowSdk.refreshMode(SAVED)                                                            // sayso's signed shadow, fresh
+  const shadow = shadowSdk.guardWalletProvider(fakeProvider())
   await shadow.sendTransaction({ to: SAVED, data: '0x', authorizationList: auth })
   assert.ok(shadowLog.some(([v, d]) => v === 'block' && d === 'shadow'))
+})
+
+test('EIP-7702: with mode left out, an authorization is refused even when the owner\'s switch says shadow (status section 7 claim)', async () => {
+  ownerSwitch = 'shadow'
+  const log: Array<[string, string]> = []
+  const sdk = new Oathline({ apiUrl, apiKey: KEY, signer: SIGNER, onDecision: (r, _t, d) => log.push([r.verdict, d]) })
+  await sdk.refreshMode(SAVED)
+  assert.equal(sdk.mode, 'shadow')
+  const p = fakeProvider()
+  await assert.rejects(() => sdk.guardWalletProvider(p).sendTransaction({ to: SAVED, data: '0x', authorizationList: [{ address: ATTACKER, chainId: 8453, nonce: 1, r: '0x01' as Hex, s: '0x01' as Hex, yParity: 0 }] }), OathlineBlocked)
+  assert.equal(p.sent.length, 0); assert.deepEqual(log.at(-1), ['block', 'refused'])
 })
 
 test('an ask held on the position side is never put to the local hook (re-check of the third review, H1)', async () => {
@@ -449,6 +498,16 @@ test('an ask held on the position side is never put to the local hook (re-check 
   assert.equal(await g.sendTransaction({ to: ASKER, data: '0x' }), '0xabc')                 // an ordinary ask: the hook may say yes
   await assert.rejects(() => g.sendTransaction({ to: HELD, data: '0x' }), OathlineNeedsApproval)
   assert.equal(hookAsked, 1); assert.equal(p.sent.length, 1)
+})
+
+test('R13b: a check that ran out of time is a refusal the agent may retry, never put to the local hook, even without the server\'s approval note', async () => {
+  const p = fakeProvider(); let hookAsked = 0
+  const g = new Oathline({ mode: 'enforce', apiUrl, apiKey: KEY, signer: SIGNER, onAsk: async () => { hookAsked++; return true } }).guardWalletProvider(p)
+  await assert.rejects(() => g.sendTransaction({ to: LATE, data: '0x' }), OathlineNeedsApproval)    // the signed ask "check took too long"
+  refuseNext = { status: 503, body: '{"error":"check took too long: the verdict could not be signed in time; ask again in a moment","code":"check-deadline"}', headers: { 'retry-after': '5' } }
+  await assert.rejects(() => g.sendTransaction({ to: SAVED, data: '0x' }), OathlineUnavailable)      // no signed answer at all: refused in enforce
+  assert.equal(hookAsked, 0); assert.equal(p.sent.length, 0)
+  assert.equal(await g.sendTransaction({ to: SAVED, data: '0x' }), '0xabc', 'asking again works')
 })
 
 test('step 2d (fix 7): batches, already signed transactions, raw RPC sends and deployments are refused in enforce mode; nothing reaches the node', async () => {
@@ -491,7 +550,10 @@ test('step 2d (fix 7): in shadow mode they go ahead, the decision says shadow, a
   const client = createWalletClient({ account: privateKeyToAccount(generatePrivateKey()), chain: base, transport })
   reports.length = 0
   const shadowLog: Array<[string, string]> = []
-  const shadow = new Oathline({ apiUrl, apiKey: KEY, signer: SIGNER, mode: 'shadow', onDecision: (r, _t, d) => shadowLog.push([r.verdict, d]) }).guard(client)
+  ownerSwitch = 'shadow'
+  const shadowSdk = new Oathline({ apiUrl, apiKey: KEY, signer: SIGNER, mode: 'shadow', onDecision: (r, _t, d) => shadowLog.push([r.verdict, d]) })
+  await shadowSdk.refreshMode(client.account.address)                                          // sayso's signed shadow, fresh
+  const shadow = shadowSdk.guard(client)
   assert.equal((await shadow.sendCalls({ calls: [{ to: SAVED, value: 1n }] })).id, '0x1')
   assert.equal(await shadow.sendRawTransaction({ serializedTransaction: '0x02' }), `0x${'22'.repeat(32)}`)
   await shadow.request({ method: 'wallet_sendCalls', params: [] } as any)
@@ -547,7 +609,10 @@ test('R2 (review M1 of 2d): the guarded viem client gives out no signing account
   assert.deepEqual(rpc.filter(m => m === 'eth_sendRawTransaction').length, 3)
   // in shadow mode the account still signs nothing on its own (there is no door to report), the transport's sends go ahead and are reported
   reports.length = 0
-  const shadow = new Oathline({ mode: 'shadow', apiUrl, apiKey: KEY, signer: SIGNER }).guard(client)
+  ownerSwitch = 'shadow'
+  const shadowSdk = new Oathline({ mode: 'shadow', apiUrl, apiKey: KEY, signer: SIGNER })
+  await shadowSdk.refreshMode(client.account.address)                                          // sayso's signed shadow, fresh
+  const shadow = shadowSdk.guard(client)
   assert.equal((shadow.account as any).signTransaction, undefined)
   assert.equal(await shadow.transport.request({ method: 'eth_sendRawTransaction', params: ['0x02'] } as any), `0x${'33'.repeat(32)}`)
   for (let i = 0; i < 50 && reports.length < 1; i++) await new Promise(r => setTimeout(r, 20))
@@ -724,7 +789,7 @@ test('0.6.3 (security desk 2026-10-25, F2): a function the SDK does not know is 
   const sends = () => toNode.filter(m => /send|sign/i.test(m))
   // viem's own ERC-7821 add-on, installed before guard(): its execute signed with the raw account before 0.6.3
   const g = enforce(mk().extend(erc7821Actions()).extend(erc7715Actions()).extend(walletActionsL2()).extend(publicActionsL2()).extend(publicActions))
-  await assert.rejects(() => g.execute(execute), (e: any) => e instanceof OathlineBlocked && /execute: this wallet function is not one sayso knows; it is refused in enforce mode until sayso supports it/.test(e.message))
+  await assert.rejects(() => g.execute(execute), (e: any) => e instanceof OathlineBlocked && /execute: this wallet function is not one sayso knows; it is refused until sayso supports it/.test(e.message))
   await assert.rejects(() => g.executeBatches({ address: account.address, batches: [] }), OathlineBlocked)
   await assert.rejects(() => g.grantPermissions({ expiry: 1, permissions: [] }), OathlineBlocked)
   await assert.rejects(() => g.initiateWithdrawal({ request: { gas: 21000n, to: ATTACKER, value: 1n } }), OathlineBlocked)
@@ -814,14 +879,14 @@ test('0.6.3 review 2026-10-27 (M3): a checked transaction is signed only for the
   assert.deepEqual((signed as any[]).map(t => t.chainId), [8453, 8453])
 })
 
-test('0.6.3 re-check 2026-10-27 (R1, R2, R3): an outage does not stop shadow mode; nested add-on functions are refused; a list on the client is not a group', async () => {
+test('0.6.3 re-check 2026-10-27 (R1, R2, R3): an outage stops shadow written in code too (decision 27 Oct); nested add-on functions are refused; a list on the client is not a group', async () => {
   const toNode: string[] = []
   const send = async ({ method }: any) => { toNode.push(method); if (method === 'eth_chainId') return '0x2105'; if (method === 'eth_getTransactionCount') return '0x0'; if (method === 'eth_estimateGas') return '0x5208'; if (method === 'eth_gasPrice' || method === 'eth_maxPriorityFeePerGas') return '0x1'; if (method === 'eth_getBlockByNumber') return { baseFeePerGas: '0x1', number: '0x1', timestamp: '0x1', hash: `0x${'0'.repeat(64)}` }; if (method === 'eth_call') return `0x${'0'.repeat(63)}5`; if (/^eth_send/.test(method)) return `0x${'1'.repeat(64)}`; throw new Error(`no rpc ${method}`) }
   const mk = (extra: any = {}) => createWalletClient({ account: privateKeyToAccount(generatePrivateKey()), chain: base, transport: custom({ request: send }), ...extra })
-  // R1: sayso unreachable, no chainId in the options: shadow mode still sends (signed for the client's chain)
+  // R1: sayso unreachable, no chainId in the options, no signed shadow from sayso: refused, `mode: 'shadow'` or not
   const down = (() => { throw new Error('unreachable') }) as unknown as typeof fetch
   const shadow = new Oathline({ mode: 'shadow', apiUrl: 'http://127.0.0.1:1', apiKey: KEY, fetch: down }).guard(mk()) as any
-  assert.match(await shadow.sendTransaction({ to: SAVED, value: 1n }), /^0x1{64}$/)
+  await assert.rejects(() => shadow.sendTransaction({ to: SAVED, value: 1n }), OathlineUnavailable)
   await assert.rejects(() => new Oathline({ mode: 'enforce', apiUrl: 'http://127.0.0.1:1', apiKey: KEY, fetch: down }).guard(mk() as any).sendTransaction({ to: SAVED, value: 1n } as any), OathlineUnavailable)
   // R2: a function nested deeper in an add-on installed before guard() is refused like a top-level one
   const raw = mk()
@@ -860,20 +925,21 @@ test('0.6.3 re-check 2026-10-26 (R4): an Array subclass with its own method, a P
   assert.equal(g.list[0], 1)   // the data is still there
 })
 
-test('0.6.3: in shadow mode an unknown function goes ahead and sayso is told "would have blocked"; before the owner\'s switch is known it is refused', async () => {
+test('0.6.3, round 5: an unknown plain function cannot ask sayso, so it is refused in shadow mode too; sayso is told once', async () => {
   const toNode: string[] = []
   const send = async ({ method }: any) => { toNode.push(method); if (method === 'eth_chainId') return '0x2105'; if (method === 'eth_getTransactionCount') return '0x0'; if (method === 'eth_estimateGas') return '0x5208'; if (method === 'eth_gasPrice' || method === 'eth_maxPriorityFeePerGas') return '0x1'; if (method === 'eth_getBlockByNumber') return { baseFeePerGas: '0x1', number: '0x1', timestamp: '0x1', hash: `0x${'0'.repeat(64)}` }; if (/^eth_send/.test(method)) return `0x${'1'.repeat(64)}`; throw new Error(`no rpc ${method}`) }
   const account = privateKeyToAccount(generatePrivateKey())
   const raw = createWalletClient({ account, chain: base, transport: custom({ request: send }) }).extend(() => ({ syncHelper: (x: number) => x + 1 }))
   await new Promise(r => setTimeout(r, 50)); reports.length = 0
   const log: string[] = []
+  ownerSwitch = 'shadow'
   const shadow = new Oathline({ mode: 'shadow', apiUrl, apiKey: KEY, signer: SIGNER, onDecision: (r, _t, d) => log.push(`${r.verdict} ${d}`) }).guard(raw) as any
-  assert.equal(shadow.syncHelper(1), 2)   // a plain function keeps its plain answer in shadow mode
+  await assert.rejects(() => shadow.syncHelper(1), OathlineBlocked)   // nothing ran
   for (let i = 0; i < 50 && reports.length < 1; i++) await new Promise(r => setTimeout(r, 20))
-  assert.deepEqual(log, ['block shadow'])
+  assert.deepEqual(log, ['block refused'])
   assert.equal(reports[0]?.kind, 'unknown wallet function (syncHelper)'); assert.equal(reports[0]?.verdict, 'block')
   // called again and again: every call is a decision, but sayso is told once (review 2026-10-27, L3)
-  for (let i = 0; i < 5; i++) shadow.syncHelper(i)
+  for (let i = 0; i < 5; i++) await assert.rejects(() => shadow.syncHelper(i), OathlineBlocked)
   await new Promise(r => setTimeout(r, 100))
   assert.equal(log.length, 6); assert.equal(reports.filter(r => r.kind === 'unknown wallet function (syncHelper)').length, 1)
   // the owner decides (no mode in code) and no answer from sayso yet: decided as enforce, like every call it cannot check
@@ -935,15 +1001,16 @@ test('review 2026-10-20 N1/N2: what is signed is exactly what was checked (no to
 
 test('review 2026-10-20 P1/P2: a wrapped provider signs only for the checked chain, and never data the check did not see', async () => {
   const signedTx: any[] = [], sentTx: any[] = []
-  const provider = { getAddress: () => SAVED, sendTransaction: async (tx: any) => { sentTx.push(tx); return '0xabc' as Hex }, signTransaction: async (tx: any) => { signedTx.push(tx); return '0xsigned' as Hex } }
+  const pk = privateKeyToAccount(generatePrivateKey())                                   // round 8: a signed transaction is decoded, so the fake signs for real
+  const provider = { getAddress: () => pk.address, sendTransaction: async (tx: any) => { sentTx.push(tx); return '0xabc' as Hex }, signTransaction: async (tx: any) => { signedTx.push(tx); return pk.signTransaction({ gas: 21000n, gasPrice: 1n, ...tx }) } }
   const g = new Oathline({ mode: 'enforce', apiUrl, apiKey: KEY, signer: SIGNER }).guardWalletProvider(provider)
   // P1: another chain is refused; no chain at all gets the checked chain, so the signature is valid on that chain only
   await assert.rejects(() => g.signTransaction({ to: SAVED, data: '0x', chainId: 1 }), OathlineBlocked)
   await assert.rejects(() => g.sendTransaction({ to: SAVED, data: '0x', chainId: 1 } as any), OathlineBlocked)
   assert.equal(signedTx.length + sentTx.length, 0)
-  assert.equal(await g.signTransaction({ to: SAVED, data: '0x', gasPrice: 1n }), '0xsigned')
+  assert.equal(parseTransaction(await g.signTransaction({ to: SAVED, data: '0x', gasPrice: 1n })).chainId, 8453)
   assert.equal(signedTx[0].chainId, 8453)
-  assert.equal(await g.signTransaction({ to: SAVED, data: '0x', chainId: 8453 }), '0xsigned')
+  assert.equal(parseTransaction(await g.signTransaction({ to: SAVED, data: '0x', chainId: 8453 })).to?.toLowerCase(), SAVED.toLowerCase())
   assert.equal(await g.sendTransaction({ to: SAVED, data: '0x', chainId: '0x2105' } as any), '0xabc')
   // P2: `input` is the same field as `data` for many signers: one the check did not see is refused
   await assert.rejects(() => g.sendTransaction({ to: SAVED, data: '0x', input: '0xa9059cbb' } as any), OathlineBlocked)
@@ -1004,6 +1071,7 @@ test('R5 part 3 (Kernel): on an EIP-7702 wallet, typed data for Kernel or the v0
   await assert.rejects(() => gp.signTypedData(kernelName), OathlineNeedsApproval)
   // shadow: signed and reported as "would have blocked" on an EIP-7702 wallet
   await new Promise(r => setTimeout(r, 100)); reports.length = 0; signed.length = 0
+  ownerSwitch = 'shadow'
   const sh = new Oathline({ apiUrl, apiKey: KEY, signer: SIGNER, mode: 'shadow' }).guardWalletProvider(provider(KERNEL_WALLET))
   await sh.signMessage(new Uint8Array(32)); await sh.signTypedData(kernelName)
   for (let i = 0; i < 50 && reports.length < 2; i++) await new Promise(r => setTimeout(r, 20))

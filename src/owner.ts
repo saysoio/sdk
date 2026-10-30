@@ -1,7 +1,7 @@
 // Owner-side helpers: the signatures that set a wallet up, the one-off instruction, and linking an approval channel.
 // The owner's key and the agent wallet's key stay with their holders; only signatures travel.
 import { getAddress, isAddressEqual, type Address, type Hex } from 'viem'
-import { OATHLINE_TYPES, mandateHash, oathlineDomain } from './typed-data'
+import { KEY_RESET_ACTION, OATHLINE_TYPES, apiKeyHash, mandateHash, newApiKey, oathlineDomain } from './typed-data'
 import { callOptions, chainFor, inviteField, type CallOptions } from './chain'
 
 /** anything that can sign EIP-712 typed data and has an address (a viem account, a wallet client's account, …) */
@@ -145,4 +145,17 @@ export async function setCheckMode(apiUrl: string, owner: TypedSigner, wallet: A
   const issuedAt = Math.floor(Date.now() / 1000)
   const signature = await owner.signTypedData({ domain: oathlineDomain(await chainFor(apiUrl, f)), types: OATHLINE_TYPES, primaryType: 'CheckMode', message: { wallet: getAddress(wallet), mode, issuedAt: BigInt(issuedAt) } })
   return post(apiUrl, `/wallets/${getAddress(wallet)}/mode`, { mode, issuedAt, signature }, callOptions(f).fetch)
+}
+
+/** Signed by the OWNER (step 3b): a new API key for this agent wallet, for a lost or leaked key. The key is made here
+ *  and only its hash is signed and sent, so sayso never sees it and a copied signature installs a key only you hold.
+ *  sayso checks that the signer is the wallet's registered owner and cancels the old key at once (every route refuses it
+ *  from then on). Returns the new key: hand it to the agent. The signature is good for 10 minutes and once only. */
+export async function rotateApiKey(apiUrl: string, owner: TypedSigner, wallet: Address, f?: CallOptions): Promise<{ wallet: Address; apiKey: string; note: string; logged?: boolean }> {
+  if (isAddressEqual(wallet, owner.address)) throw new Error('the owner must be a different wallet from the agent\'s')
+  const w = getAddress(wallet), nonce = randomNonce(), issuedAt = Math.floor(Date.now() / 1000)
+  const apiKey = newApiKey(), keyHash = apiKeyHash(apiKey)
+  const signature = await owner.signTypedData({ domain: oathlineDomain(await chainFor(apiUrl, f)), types: OATHLINE_TYPES, primaryType: 'KeyReset', message: { wallet: w, owner: getAddress(owner.address), action: KEY_RESET_ACTION, nonce, issuedAt: BigInt(issuedAt), keyHash } })
+  const r = await post(apiUrl, `/wallets/${w}/key`, { nonce, issuedAt, keyHash, signature }, callOptions(f).fetch)
+  return { ...r, wallet: w, apiKey }
 }
